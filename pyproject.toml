@@ -1,0 +1,21 @@
+[project]
+name = "table42"
+version = "0.1.0"
+description = "A standalone tabletop exercise app with local accounts, injects, group-attributed replies, and exports."
+license = "GPL-3.0-only"
+authors = [{ name = "Range42 contributors" }]
+requires-python = ">=3.12"
+dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "python-multipart>=0.0.20,<1"]
+
+[project.urls]
+Repository = "https://github.com/range42/table42"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "httpx>=0.28,<1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120

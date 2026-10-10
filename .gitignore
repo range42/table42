@@ -1,0 +1,35 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+data/
+*.pyc
+
+# Local configuration, accounts, exercise data, and exports
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+uploads/
+backups/
+exports/
+table42-exercise*.json
+exercise.json
+*.zip
+
+# Tool output and packaging
+test-results/
+playwright-report/
+screenshots/
+dist/
+build/
+*.egg-info/
+*.log
+.coverage
+htmlcov/
+.DS_Store
+*.swp
