@@ -22,6 +22,7 @@ from .schemas import (
     PasswordReset, PreviewAnswers, PublicationSet, Question, ResponseSet, StatusSet, UserCreate, VariantSet, validate_answers,
 )
 from .security import hash_password, token_hash, verify_password
+from .reports import build_pdf, snapshot
 
 
 STATIC = Path(__file__).parent / 'static'
@@ -648,6 +649,33 @@ def create_app(data_dir=None):
             preview = row['media_type'].startswith(('image/', 'video/', 'audio/'))
             return FileResponse(path, media_type=row['media_type'], filename=row['filename'],
                                 content_disposition_type='inline' if preview else 'attachment')
+
+    @app.get('/api/exercises/{eid}/report.pdf')
+    def pdf_report(eid: int, request: Request):
+        with store.connect() as db:
+            db.execute('BEGIN')
+            exercise, _, _ = exercise_access(db, actor(db, request), eid, director=True)
+            data = snapshot(db, exercise, now())
+        buffer = tempfile.TemporaryFile()
+        try:
+            build_pdf(data, buffer)
+            length = buffer.tell()
+            buffer.seek(0)
+        except BaseException:
+            buffer.close()
+            raise
+
+        def stream_report():
+            try:
+                while chunk := buffer.read(1024 * 1024):
+                    yield chunk
+            finally:
+                buffer.close()
+
+        return StreamingResponse(stream_report(), media_type='application/pdf', headers={
+            'Content-Disposition': f'attachment; filename="exercise-{eid}-report.pdf"',
+            'Content-Length': str(length),
+        })
 
     @app.get('/api/exercises/{eid}/export.zip')
     def export(eid: int, request: Request):

@@ -62,6 +62,7 @@ with tempfile.TemporaryDirectory(prefix='table42-ux-') as directory:
             page.on('pageerror', lambda error: errors.append(str(error)))
             page.goto(f'{base}/#exercise/{eid}/board')
             expect(page.get_by_role('heading', name='Release board', exact=True)).to_be_visible()
+            expect(page.get_by_role('link', name='Export PDF report', exact=True)).to_be_visible()
             page.get_by_role('button', name='Publish all injects', exact=True).click()
             expect(page.locator('.release-cell[data-status="published"]')).to_have_count(42)
             page.get_by_role('button', name='Start exercise', exact=True).click()
@@ -240,6 +241,11 @@ with tempfile.TemporaryDirectory(prefix='table42-ux-') as directory:
             assert copied_alice['group_name'] == 'Blue team'
             assert all(inject['response_count'] == 0 for inject in copied['injects'])
             assert alice.request.get(f'{base}/api/injects/{first["id"]}/responses').json()[0]['revision'] == 2
+            with page.expect_download() as download:
+                page.get_by_role('link', name='Export PDF report', exact=True).click()
+            assert download.value.suggested_filename == f'exercise-{clone_id}-report.pdf'
+            assert download.value.failure() is None
+            assert alice.get_by_role('link', name='Export PDF report', exact=True).count() == 0
             page.goto(f'{base}/#exercise/{eid}/board')
             expect(page.locator('.release-cell[data-status="answered"]')).to_have_count(1)
             if destination := os.getenv('TABLE42_SCREENSHOT_DIR'):
