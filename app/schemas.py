@@ -61,6 +61,14 @@ class StatusSet(Input):
 
 class PublicationSet(Input):
     published: bool = Field(strict=True)
+    group_id: int | None = Field(default=None, gt=0)
+    user_id: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode='after')
+    def one_recipient(self):
+        if self.group_id is not None and self.user_id is not None:
+            raise ValueError('Select one team or one individual participant.')
+        return self
 
 
 class VariantSet(Input):

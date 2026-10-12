@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from .board import board_targets, exercise_board, publication_scope, publication_target, published_for
 from .db import Store, many, one
 from .schemas import (
     Credentials, ExerciseCreate, GroupCreate, InjectSet, MemberSet, PasswordChange,
@@ -120,9 +121,26 @@ def create_app(data_dir=None):
         if not inject:
             raise HTTPException(404, 'Inject not found.')
         exercise, member, is_director = exercise_access(db, user, inject['exercise_id'], director)
+        variant = inject['active_variant']
+        inject = inject_with_publication(db, inject, member, is_director)
+        inject['active_variant'] = variant  # Internal attachment access still needs the selected variant.
         if not is_director and (not inject['published'] or exercise['status'] == 'draft'):
             raise HTTPException(404, 'Inject not found.')
-        return inject_data(inject), exercise, member, is_director
+        return inject, exercise, member, is_director
+
+    def inject_with_publication(db, row, member, director, targets=None):
+        result = inject_data(row, director)
+        publications = many(db, 'SELECT group_id,user_id,published FROM inject_publications WHERE inject_id=?',
+                            (row['id'],))
+        if director:
+            scope = publication_scope(row, publications, targets if targets is not None else
+                                      board_targets(db, row['exercise_id']))
+            result.update(published=scope != 'none', publication_scope=scope,
+                          published_by_default=bool(row['published']),
+                          publications=[{**item, 'published': bool(item['published'])} for item in publications])
+        else:
+            result['published'] = published_for(row, publications, publication_target(member) if member else None)
+        return result
 
     def response_access(db, user, rid):
         row = one(db, 'SELECT * FROM responses WHERE id=?', (rid,))
@@ -269,11 +287,12 @@ def create_app(data_dir=None):
             user = actor(db, request)
             exercise, member, director = exercise_access(db, user, eid)
             rows = many(db, 'SELECT * FROM injects WHERE exercise_id=? ORDER BY position,id', (eid,))
+            targets = board_targets(db, eid) if director else None
             injects = []
             for row in rows:
-                if not director and (not row['published'] or exercise['status'] == 'draft'):
+                inject = inject_with_publication(db, row, member, director, targets)
+                if not director and (not inject['published'] or exercise['status'] == 'draft'):
                     continue
-                inject = inject_data(row, director)
                 inject['attachments'] = attachment_rows(db, inject['id'], variant=row['active_variant'])
                 if director:
                     for key, variant in inject['variants'].items():
@@ -293,6 +312,13 @@ def create_app(data_dir=None):
             return {**exercise, 'is_director': director, 'membership': member, 'injects': injects,
                     'groups': groups,
                     'members': members}
+
+    @app.get('/api/exercises/{eid}/board')
+    def director_board(eid: int, request: Request):
+        with store.connect() as db:
+            db.execute('BEGIN')
+            exercise_access(db, actor(db, request), eid, director=True)
+            return exercise_board(db, eid)
 
     @app.post('/api/exercises/{eid}/details')
     def edit_exercise(eid: int, payload: ExerciseCreate, request: Request):
@@ -392,8 +418,26 @@ def create_app(data_dir=None):
     @app.post('/api/injects/{iid}/publication')
     def publication(iid: int, payload: PublicationSet, request: Request):
         with store.connect() as db:
-            inject_access(db, actor(db, request), iid, director=True)
-            db.execute('UPDATE injects SET published=? WHERE id=?', (int(payload.published), iid))
+            db.execute('BEGIN IMMEDIATE')
+            inject, _, _, _ = inject_access(db, actor(db, request), iid, director=True)
+            if payload.group_id is not None:
+                if not one(db, 'SELECT id FROM groups WHERE id=? AND exercise_id=?',
+                           (payload.group_id, inject['exercise_id'])):
+                    raise HTTPException(422, 'Select a team from this exercise.')
+                db.execute('''INSERT INTO inject_publications(inject_id,group_id,published) VALUES (?,?,?)
+                              ON CONFLICT(inject_id,group_id) DO UPDATE SET published=excluded.published''',
+                           (iid, payload.group_id, int(payload.published)))
+            elif payload.user_id is not None:
+                if not one(db, '''SELECT user_id FROM members WHERE exercise_id=? AND user_id=?
+                                  AND role='participant' AND group_id IS NULL''',
+                           (inject['exercise_id'], payload.user_id)):
+                    raise HTTPException(422, 'Select an individual participant without a team in this exercise.')
+                db.execute('''INSERT INTO inject_publications(inject_id,user_id,published) VALUES (?,?,?)
+                              ON CONFLICT(inject_id,user_id) DO UPDATE SET published=excluded.published''',
+                           (iid, payload.user_id, int(payload.published)))
+            else:
+                db.execute('UPDATE injects SET published=? WHERE id=?', (int(payload.published), iid))
+                db.execute('DELETE FROM inject_publications WHERE inject_id=?', (iid,))
         return {'ok': True}
 
     @app.get('/api/injects/{iid}/responses')
@@ -542,6 +586,9 @@ def create_app(data_dir=None):
             data = {'exported_at': now(), 'exercise': exercise, 'members': members,
                     'groups': many(db, 'SELECT * FROM groups WHERE exercise_id=?', (eid,)),
                     'injects': injects, 'responses': responses, 'response_history': history,
+                    'publications': [{**row, 'published': bool(row['published'])} for row in many(db,
+                        '''SELECT p.* FROM inject_publications p JOIN injects i ON i.id=p.inject_id
+                           WHERE i.exercise_id=? ORDER BY p.id''', (eid,))],
                     'attachments': [{k: v for k, v in a.items() if k != 'storage_name'} for a in attachments]}
             output = io.StringIO(newline='')
             writer = csv.writer(output)

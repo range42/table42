@@ -33,6 +33,13 @@ CREATE TABLE IF NOT EXISTS injects (
     description TEXT NOT NULL DEFAULT '', questions TEXT NOT NULL,
     published INTEGER NOT NULL DEFAULT 0, position INTEGER NOT NULL, created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS inject_publications (
+    id INTEGER PRIMARY KEY, inject_id INTEGER NOT NULL REFERENCES injects(id),
+    group_id INTEGER REFERENCES groups(id), user_id INTEGER REFERENCES users(id),
+    published INTEGER NOT NULL CHECK(published IN (0,1)),
+    CHECK((group_id IS NOT NULL) != (user_id IS NOT NULL)),
+    UNIQUE(inject_id, group_id), UNIQUE(inject_id, user_id)
+);
 CREATE TABLE IF NOT EXISTS responses (
     id INTEGER PRIMARY KEY, inject_id INTEGER NOT NULL REFERENCES injects(id),
     user_id INTEGER NOT NULL REFERENCES users(id), group_id INTEGER REFERENCES groups(id),

@@ -31,3 +31,4 @@ def test_upgrade_keeps_legacy_injects_and_adds_private_metadata(tmp_path):
         public = inject_data(row, director=False)
         assert 'facilitator_notes' not in public
         assert public['information_only'] is False
+        assert db.execute('SELECT COUNT(*) FROM inject_publications').fetchone()[0] == 0

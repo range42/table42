@@ -1,6 +1,6 @@
 const root = document.querySelector('#app');
 const editor = document.querySelector('#editor');
-const state = { user: null, csrf: '', exercise: null, selected: null, responses: [], tab: 'injects', dirty: false, filter: '', preview: false, previewDrafts: true, previewGroup: '', previewAnswers: {}, previewVariants: {} };
+const state = { user: null, csrf: '', exercise: null, board: null, selected: null, responses: [], tab: 'injects', dirty: false, filter: '', preview: false, previewDrafts: true, previewGroup: '', previewAnswers: {}, previewVariants: {} };
 let noticeTimer;
 let loading = false;
 
@@ -80,24 +80,57 @@ async function dashboard() {
       : empty(state.user.is_admin ? 'Set the scene' : 'No exercises assigned yet', state.user.is_admin ? 'Create an exercise, add your groups, and prepare the first inject.' : 'Your director will add you to an exercise. Refresh this page when you are ready.', create)}`);
 }
 
-async function exercisePage(id, quiet = false, preview = false) {
+async function exercisePage(id, quiet = false, section = '') {
   const exercise = await api(`/exercises/${id}`);
-  if (state.exercise?.id !== exercise.id) { state.selected = null; state.tab = 'injects'; state.filter = ''; state.previewDrafts = true; state.previewGroup = ''; state.previewAnswers = {}; state.previewVariants = {}; }
+  if (state.exercise?.id !== exercise.id) { state.selected = null; state.tab = exercise.is_director ? 'board' : 'injects'; state.filter = ''; state.previewDrafts = true; state.previewGroup = ''; state.previewAnswers = {}; state.previewVariants = {}; }
   if (quiet && (state.dirty || editor.open)) return;
+  if (exercise.is_director && ['board', 'injects', 'people'].includes(section)) state.tab = section;
+  const focusedCell = document.activeElement?.closest('.release-cell');
+  const boardScroll = document.querySelector('.release-table-wrap')?.scrollLeft || 0;
+  const boardScrollTop = document.querySelector('.release-table-wrap')?.scrollTop || 0;
   state.exercise = exercise;
-  state.preview = preview && exercise.is_director;
+  state.preview = section === 'preview' && exercise.is_director;
   if (state.preview) { previewPage(); return; }
   if (!exercise.injects.some(i => i.id === state.selected)) state.selected = exercise.injects[0]?.id ?? null;
-  state.responses = state.selected ? await api(`/injects/${state.selected}/responses`) : [];
   const director = exercise.is_director;
+  state.responses = state.selected && (!director || state.tab === 'injects') ? await api(`/injects/${state.selected}/responses`) : [];
+  if (director && state.tab === 'board') state.board = await api(`/exercises/${id}/board`);
   const statusAction = exercise.status === 'live' ? ['closed', 'Close exercise'] : ['live', exercise.status === 'closed' ? 'Reopen exercise' : 'Start exercise'];
   const controls = director ? `<div><div class="row"><a class="button" href="#exercise/${id}/preview">Preview exercise</a><a class="button" href="/api/exercises/${id}/export.zip">↓ Export results</a><button data-action="edit-exercise">Edit</button><button class="primary" data-action="status" data-status="${statusAction[0]}">${statusAction[1]}</button></div><small class="muted">Export includes CSV, JSON, and all attachments.</small></div>` : '<button data-action="refresh">Refresh</button>';
   shell(`<div class="page-head"><div><p class="eyebrow"><a href="#">Exercises</a> / Exercise room</p><div class="row"><h1>${esc(exercise.name)}</h1>${badge(exercise.status)}</div><p class="muted text">${esc(exercise.description)}</p></div>${controls}</div>
     ${exercise.status === 'draft' ? '<div class="banner">This exercise is being prepared. Participants will see published injects when the director starts the exercise.</div>' : ''}
     ${exercise.status === 'closed' ? '<div class="banner">The exercise is closed. Responses remain available for review and export.</div>' : ''}
-    ${director ? `<div class="tabs" role="tablist" aria-label="Exercise sections"><button role="tab" aria-selected="${state.tab === 'injects'}" class="${state.tab === 'injects' ? 'active' : ''}" data-action="tab" data-tab="injects">Injects & responses</button><button role="tab" aria-selected="${state.tab === 'people'}" class="${state.tab === 'people' ? 'active' : ''}" data-action="tab" data-tab="people">Groups & members</button></div>` : ''}
-    ${state.tab === 'people' && director ? peoplePanel() : injectPanel()}`);
+    ${director ? `<div class="tabs" role="tablist" aria-label="Exercise sections"><button role="tab" aria-selected="${state.tab === 'board'}" class="${state.tab === 'board' ? 'active' : ''}" data-action="tab" data-tab="board">Director board</button><button role="tab" aria-selected="${state.tab === 'injects'}" class="${state.tab === 'injects' ? 'active' : ''}" data-action="tab" data-tab="injects">Injects & responses</button><button role="tab" aria-selected="${state.tab === 'people'}" class="${state.tab === 'people' ? 'active' : ''}" data-action="tab" data-tab="people">Groups & members</button></div>` : ''}
+    ${director && state.tab === 'board' ? directorBoard() : state.tab === 'people' && director ? peoplePanel() : injectPanel()}`);
+  const boardTable = document.querySelector('.release-table-wrap');
+  if (boardTable) {
+    boardTable.scrollLeft = boardScroll;
+    boardTable.scrollTop = boardScrollTop;
+    if (focusedCell) [...boardTable.querySelectorAll('.release-cell')].find(cell =>
+      cell.dataset.id === focusedCell.dataset.id && cell.dataset.targetKey === focusedCell.dataset.targetKey
+    )?.focus({ preventScroll: true });
+  }
   focusInjectSequence();
+}
+
+function directorBoard() {
+  const { targets, injects } = state.board;
+  const labels = { unpublished: 'Unpublished', published: 'Published', answered: 'Answered' };
+  const counts = Object.fromEntries(Object.keys(labels).map(status => [status,
+    injects.reduce((total, inject) => total + inject.cells.filter(cell => cell.status === status).length, 0)
+  ]));
+  const header = `<header class="release-head row between"><div><p class="eyebrow">Exercise direction</p><h2>Release board</h2><p class="muted">Click a cell to publish or unpublish for that team or participant.</p></div><div class="row"><button data-action="refresh">Refresh</button><button class="primary" data-action="new-inject">+ New inject</button></div></header>`;
+  if (!targets.length) return `<section class="card release-board">${header}${empty('Add your teams or participants', 'Assign exercise members to start managing releases for each team or person.', '<button class="primary" data-action="member">+ Assign member</button><button data-action="new-group">+ Add team</button>')}</section>`;
+  if (!injects.length) return `<section class="card release-board">${header}${empty('Prepare your first inject', 'Your injects will appear as rows, with one release control for each team or participant.')}</section>`;
+  return `<section class="card release-board">${header}
+    <div class="release-summary" aria-label="Release status summary">${Object.entries(labels).map(([status, label]) => `<div class="release-stat ${status}"><span class="release-dot" aria-hidden="true"></span><strong>${counts[status]}</strong><span>${label}</span></div>`).join('')}</div>
+    <div class="table-wrap release-table-wrap" tabindex="0" role="region" aria-label="Injects by team and participant, scroll to see all columns"><table class="release-table"><caption class="sr-only">Inject publication and question completion for every team and individual participant</caption><thead><tr><th scope="col">Inject sequence</th>${targets.map(target => `<th scope="col"><strong>${esc(target.name)}</strong><span>${target.kind === 'group' ? `Team · ${target.member_count} member${target.member_count === 1 ? '' : 's'}` : 'Individual participant'}</span></th>`).join('')}</tr></thead><tbody>${injects.map((inject, index) => `<tr><th scope="row"><div class="release-inject"><span class="release-number">${String(index + 1).padStart(2, '0')}</span><div><button class="inject-link" data-action="board-open-inject" data-id="${inject.id}" aria-label="Open inject: ${esc(inject.name)}">${esc(inject.name)}</button>${inject.session_time ? `<span class="muted">${esc(inject.session_time)}</span>` : ''}${inject.optional ? '<span class="badge optional">Optional</span>' : ''}</div></div></th>${inject.cells.map((cell, position) => {
+      const target = targets[position];
+      const label = labels[cell.status];
+      const action = cell.published ? 'Unpublish' : 'Publish';
+      return `<td><button type="button" class="release-cell ${cell.status}" data-action="team-publication" data-id="${inject.id}" data-target-key="${esc(target.key)}" data-target-kind="${target.kind}" data-target-id="${target.id}" data-published="${cell.published}" data-status="${cell.status}" aria-pressed="${cell.published}" aria-label="${esc(`${action} ${inject.name} for ${target.name}. ${label}. ${cell.answered_count} of ${cell.question_count} questions answered.`)}" title="${action} for ${esc(target.name)}"><span class="release-state"><span class="release-dot" aria-hidden="true">${cell.status === 'answered' ? '✓' : ''}</span><strong>${label}</strong></span><span>${cell.question_count ? `${cell.answered_count} / ${cell.question_count} questions` : 'No questions'}</span><small>${cell.response_count} repl${cell.response_count === 1 ? 'y' : 'ies'}</small></button></td>`;
+    }).join('')}</tr>`).join('')}</tbody></table></div>
+    <footer class="release-footer"><p>A team is answered when its saved replies cover every question, including optional questions. Information updates stay orange when published.</p><span>Updates every 15 seconds</span></footer></section>`;
 }
 
 function peoplePanel() {
@@ -128,12 +161,18 @@ function variantPicker(inject, preview = false) {
 function previewInject() {
   const inject = state.exercise.injects.find(item => item.id === state.selected);
   const variant = inject?.variants?.[state.previewVariants[inject.id] || inject.active_variant];
-  return variant ? { ...inject, description: variant.description, attachments: variant.attachments } : inject;
+  if (!inject) return null;
+  return { ...inject, ...(variant ? { description: variant.description, attachments: variant.attachments } : {}), published: previewPublished(inject) };
+}
+
+function previewPublished(inject) {
+  const override = state.previewGroup && inject.publications?.find(item => String(item.group_id) === state.previewGroup);
+  return override ? override.published : inject.published_by_default ?? inject.published;
 }
 
 function previewPage() {
   const ex = state.exercise;
-  const injects = ex.injects.filter(inject => state.previewDrafts || inject.published);
+  const injects = ex.injects.filter(inject => state.previewDrafts || previewPublished(inject)).map(inject => ({ ...inject, published: previewPublished(inject) }));
   if (!injects.some(inject => inject.id === state.selected)) state.selected = injects[0]?.id ?? null;
   const inject = previewInject();
   const group = ex.groups.find(item => String(item.id) === state.previewGroup);
@@ -240,7 +279,7 @@ async function load(quiet = false) {
       if (!state.user) { auth(session.needs_setup); return; }
     }
     const route = location.hash.slice(1).split('/');
-    if (route[0] === 'exercise' && /^\d+$/.test(route[1])) await exercisePage(Number(route[1]), quiet, route[2] === 'preview');
+    if (route[0] === 'exercise' && /^\d+$/.test(route[1])) await exercisePage(Number(route[1]), quiet, route[2] || '');
     else if (route[0] === 'users' && state.user.is_admin) await usersPage();
     else if (route[0] === 'account') accountPage();
     else await dashboard();
@@ -309,8 +348,21 @@ document.addEventListener('click', event => {
       button.hidden = count + 1 >= Number(list.dataset.max);
     }
     else if (action === 'select-inject' && allowDiscard()) { state.selected = Number(button.dataset.id); state.filter = ''; await load(); }
-    else if (action === 'tab' && allowDiscard()) { state.tab = button.dataset.tab; await load(); }
+    else if (action === 'board-open-inject') { state.selected = Number(button.dataset.id); state.filter = ''; state.tab = 'injects'; location.hash = `exercise/${ex.id}/injects`; }
+    else if (action === 'tab' && allowDiscard()) { state.tab = button.dataset.tab; const hash = `#exercise/${ex.id}/${state.tab}`; if (location.hash === hash) await load(); else location.hash = hash; }
     else if (action === 'refresh' && allowDiscard()) await load();
+    else if (action === 'team-publication') {
+      if (button.disabled) return;
+      button.disabled = true;
+      const published = button.dataset.published !== 'true';
+      try {
+        await api(`/injects/${button.dataset.id}/publication`, {
+          published, [`${button.dataset.targetKind === 'group' ? 'group' : 'user'}_id`]: Number(button.dataset.targetId)
+        });
+        notify(published ? 'Inject published for this recipient.' : 'Inject unpublished for this recipient.');
+        await load();
+      } finally { if (button.isConnected) button.disabled = false; }
+    }
     else if (action === 'publication') { await api(`/injects/${inject.id}/publication`, { published: !inject.published }); notify(inject.published ? 'Inject unpublished.' : 'Inject published.'); await load(); }
     else if (action === 'status') {
       if (button.dataset.status === 'closed' && !confirm('Close this exercise? Participants will no longer be able to edit replies.')) return;
@@ -432,7 +484,7 @@ document.addEventListener('submit', event => {
       const payload = { name: values.name, description: values.description, questions, sender: values.sender, session_time: values.session_time,
         facilitator_notes: values.facilitator_notes, optional: form.querySelector('[name=optional]').checked, information_only: informationOnly };
       const result = await api(form.dataset.id ? `/injects/${form.dataset.id}/details` : `/exercises/${ex.id}/injects`, payload);
-      if (result.id) state.selected = result.id;
+      if (result.id) { state.selected = result.id; state.tab = 'injects'; location.hash = `exercise/${ex.id}/injects`; }
     } else if (kind === 'response') {
       const inject = ex.injects.find(i => i.id === state.selected);
       const answers = readAnswers(form, inject);
