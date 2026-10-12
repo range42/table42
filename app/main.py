@@ -10,6 +10,7 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -651,14 +652,14 @@ def create_app(data_dir=None):
                                 content_disposition_type='inline' if preview else 'attachment')
 
     @app.get('/api/exercises/{eid}/report.pdf')
-    def pdf_report(eid: int, request: Request):
+    def pdf_report(eid: int, request: Request, lang: Literal['en', 'fr', 'de'] = 'en'):
         with store.connect() as db:
             db.execute('BEGIN')
             exercise, _, _ = exercise_access(db, actor(db, request), eid, director=True)
             data = snapshot(db, exercise, now())
         buffer = tempfile.TemporaryFile()
         try:
-            build_pdf(data, buffer)
+            build_pdf(data, buffer, language=lang)
             length = buffer.tell()
             buffer.seek(0)
         except BaseException:

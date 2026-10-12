@@ -189,3 +189,106 @@ def test_pdf_only_lists_material_from_the_active_scenario_variant(world):
     _, text = report(world)
     assert 'chosen.txt' in text
     assert 'unused.txt' not in text
+
+
+def red_team(world):
+    eid = world['exercise']['id']
+    group = post(world['admin'], f'/api/exercises/{eid}/groups', {'name': 'Red team'}).json()
+    assert post(world['admin'], f'/api/exercises/{eid}/members', {
+        'user_id': world['users'][2]['id'], 'role': 'participant', 'group_id': group['id'],
+    }).status_code == 200
+    return group
+
+
+def test_pdf_separates_team_responses_on_pages_with_prominent_attribution(world):
+    red_team(world)
+    publish(world)
+    iid = world['inject']['id']
+    post(world['alice'], f'/api/injects/{iid}/responses', response_payload(
+        answers={**response_payload()['answers'], 'assessment': 'BLUE RESPONSE ONLY'},
+    ))
+    post(world['outsider'], f'/api/injects/{iid}/responses', response_payload(
+        answers={**response_payload()['answers'], 'assessment': 'RED RESPONSE ONLY'},
+    ))
+    reader, _ = report(world)
+    blue = [page.extract_text() for page in reader.pages if 'BLUE RESPONSE ONLY' in page.extract_text()]
+    red = [page.extract_text() for page in reader.pages if 'RED RESPONSE ONLY' in page.extract_text()]
+    assert blue and red
+    assert all('Team: Blue team' in text and 'Response by Alice' in text and 'RED RESPONSE ONLY' not in text
+               for text in blue)
+    assert all('Team: Red team' in text and 'Response by Outsider' in text and 'BLUE RESPONSE ONLY' not in text
+               for text in red)
+
+
+def test_pdf_reports_question_statistics_and_missing_replies_within_each_team(world):
+    red_team(world)
+    publish(world)
+    iid = world['inject']['id']
+    post(world['alice'], f'/api/injects/{iid}/responses', response_payload(
+        answers={**response_payload()['answers'], 'count': 0},
+    ))
+    post(world['bob'], f'/api/injects/{iid}/responses', response_payload(
+        answers={**response_payload()['answers'], 'count': 10},
+    ))
+    reader, _ = report(world)
+    blue = re.sub(r'\s+', ' ', ' '.join(page.extract_text() for page in reader.pages
+                                     if 'Team: Blue team' in page.extract_text()))
+    red = ' '.join(page.extract_text() for page in reader.pages if 'Team: Red team' in page.extract_text())
+    assert 'Numeric summary: n=2; min=0; max=10; mean=5' in blue
+    assert 'Response by Alice' in blue and 'Response by Bob' in blue
+    assert 'No submitted replies for this team' in red
+    assert 'Your assessment' in red and 'No answer' in red
+    assert 'Numeric summary' not in red
+
+
+def test_pdf_repeats_team_and_author_when_a_long_response_continues(world):
+    publish(world)
+    iid = world['inject']['id']
+    post(world['alice'], f'/api/injects/{iid}/responses', response_payload(
+        answers={**response_payload()['answers'], 'assessment': 'Detailed finding ' * 1000 + 'END OF LONG RESPONSE'},
+    ))
+    reader, text = report(world)
+    continuation = [page.extract_text() for page in reader.pages if 'Detailed finding' in page.extract_text()]
+    assert len(continuation) > 3
+    assert all('Team: Blue team' in page and 'Initial alert' in page and 'Response by Alice' in page
+               for page in continuation)
+    assert 'END OF LONG RESPONSE' in text
+
+
+def test_pdf_keeps_former_individual_replies_separate_from_current_team(world):
+    admin, eid, iid = world['admin'], world['exercise']['id'], world['inject']['id']
+    uid = world['users'][0]['id']
+    post(admin, f'/api/exercises/{eid}/members', {'user_id': uid, 'role': 'participant', 'group_id': None})
+    publish(world)
+    post(world['alice'], f'/api/injects/{iid}/responses', response_payload(
+        answers={**response_payload()['answers'], 'assessment': 'INDIVIDUAL RESPONSE'},
+    ))
+    post(admin, f'/api/exercises/{eid}/members', {
+        'user_id': uid, 'role': 'participant', 'group_id': world['group']['id'],
+    })
+    reader, _ = report(world)
+    pages = [page.extract_text() for page in reader.pages if 'INDIVIDUAL RESPONSE' in page.extract_text()]
+    assert pages
+    assert all('Individual respondent: Alice' in text and 'Team: Blue team' not in text for text in pages)
+
+
+def test_pdf_keeps_large_matrix_answers_readable_across_team_pages(world):
+    admin, eid = world['admin'], world['exercise']['id']
+    rows, columns = [f'Row {index}' for index in range(6)], ['Action', 'Owner', 'Deadline']
+    inject = post(admin, f'/api/exercises/{eid}/injects', {
+        'name': 'Long matrix', 'questions': [
+            {'id': 'matrix', 'label': 'Detailed actions', 'type': 'matrix', 'rows': rows, 'columns': columns},
+        ],
+    }).json()
+    publish(world)
+    post(admin, f"/api/injects/{inject['id']}/publication", {'published': True})
+    matrix = {row: {column: 'Cell content ' * 60 + f'ROW-{ri}-COLUMN-{ci}-END'
+                    for ci, column in enumerate(columns)} for ri, row in enumerate(rows)}
+    assert post(world['alice'], f"/api/injects/{inject['id']}/responses", {
+        'revision': 0, 'answers': {'matrix': matrix},
+    }).status_code == 200
+    reader, text = report(world)
+    pages = [page.extract_text() for page in reader.pages if 'Cell content' in page.extract_text()]
+    assert len(pages) > 1
+    assert all('Team: Blue team' in page and 'Long matrix' in page and 'Response by Alice' in page for page in pages)
+    assert 'ROW-5-COLUMN-2-END' in text
