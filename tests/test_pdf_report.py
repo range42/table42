@@ -42,6 +42,7 @@ def test_pdf_contains_latest_attributed_answers_and_retains_unpublished_work(wor
     assert 'Retained completed injects: 1' in text
     assert 'Released completion: N/A' in text  # Saved answers are retained but no work is released now.
     assert 'Retained complete' in text
+    assert 'Authors' in text  # Keep the table heading readable rather than splitting it mid-word.
     assert 'Blue team 2 1 1 N/A 1 0 / 0' in text
     with world['app'].state.store.connect() as db:
         assert db.execute('SELECT revision FROM responses').fetchone()[0] == 2

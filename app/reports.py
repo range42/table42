@@ -196,12 +196,12 @@ def build_pdf(data, output=None):
         'reply is shown. Full revision history and original evidence files are in the ZIP export.', 'small')])
     story.append(paragraph('Team and individual progress', 'heading'))
     if data['teams']:
-        story.append(table(['Team / person', 'Current\nparticipants', 'Authors', 'Saved\nreplies',
+        story.append(table(['Team / person', 'Roster', 'Authors', 'Saved\nreplies',
                             'Released\ncompletion', 'Retained\ncomplete', 'Questions\nanswered'], [
             [team['name'], team['member_count'], team['authors'], team['replies'],
              coverage(team['completed'], team['released']), team['retained'],
              f"{team['answered']} / {team['questions']}"]
-            for team in data['teams']], [WIDTH * ratio for ratio in (.24, .1, .08, .1, .2, .14, .14)]))
+            for team in data['teams']], [WIDTH * ratio for ratio in (.23, .1, .09, .1, .2, .14, .14)]))
     else:
         story.append(paragraph('No teams or individual participants are assigned.'))
     story.append(paragraph('Inject overview', 'heading'))
