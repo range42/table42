@@ -111,7 +111,7 @@ with tempfile.TemporaryDirectory(prefix='table42-browser-') as directory:
             popup.wait_for_load_state()
             expect(popup.locator('img')).to_be_visible()
             popup.close()
-            expect(page.get_by_role('button', name='Publish inject', exact=True)).to_have_count(0)
+            expect(page.get_by_role('button', name='Publish for all', exact=True)).to_have_count(0)
             expect(page.get_by_role('button', name='Start exercise', exact=True)).to_have_count(0)
             expect(page.get_by_role('link', name='Export results', exact=True)).to_have_count(0)
             page.get_by_label('Preview group', exact=True).select_option(label='Blue team')
@@ -164,8 +164,10 @@ with tempfile.TemporaryDirectory(prefix='table42-browser-') as directory:
             blue_cell.click()
             expect(blue_cell).to_have_attribute('data-status', 'unpublished')
             page.get_by_role('tab', name='Injects & responses', exact=True).click()
-            page.get_by_role('button', name='Publish inject').click()
-            expect(page.get_by_role('button', name='Unpublish', exact=True)).to_be_visible()
+            expect(page.get_by_role('tab', name='Injects & responses', exact=True)).to_have_attribute('aria-selected', 'true')
+            page.get_by_role('button', name='Publish for all', exact=True).click()
+            expect(page.get_by_role('button', name='Unpublish for all', exact=True)).to_be_visible()
+            expect(page.locator('.inject-head .badge').first).to_have_text('published')
             page.locator('input[type=file]').set_input_files({'name': 'brief.txt', 'mimeType': 'text/plain', 'buffer': b'Scenario facts'})
             page.get_by_role('button', name='Upload files').click()
             expect(page.get_by_role('link', name='brief.txt')).to_be_visible()
@@ -185,6 +187,7 @@ with tempfile.TemporaryDirectory(prefix='table42-browser-') as directory:
             alice.get_by_label('Priority', exact=True).select_option('High')
             alice.get_by_role('button', name='Submit response').click()
             expect(alice.get_by_role('button', name='Save changes')).to_be_visible()
+            alice.get_by_text('Team replies (1)', exact=True).click()
             expect(alice.get_by_text('Alice', exact=True).last).to_be_visible()
             alice.locator('input[type=file]').set_input_files({'name': 'evidence.txt', 'mimeType': 'text/plain', 'buffer': b'Evidence'})
             alice.get_by_role('button', name='Upload files').click()
@@ -219,13 +222,15 @@ with tempfile.TemporaryDirectory(prefix='table42-browser-') as directory:
             last_cell.scroll_into_view_if_needed()
             last_cell.focus()
             old_table = page.locator('.release-table-wrap').element_handle()
-            scroll_top = old_table.evaluate('el => el.scrollTop')
+            scroll_top = page.evaluate('scrollY')
             assert scroll_top > 0
+            assert old_table.evaluate('el => el.scrollHeight <= el.clientHeight + 1')
             page.evaluate('window.dispatchEvent(new HashChangeEvent("hashchange"))')
             page.wait_for_function('table => !table.isConnected', arg=old_table)
             expect(last_cell).to_be_focused()
-            assert abs(page.locator('.release-table-wrap').evaluate('el => el.scrollTop') - scroll_top) < 2
-            page.locator('.release-table-wrap').evaluate('el => { el.scrollTop = 0; el.scrollLeft = 0; }')
+            assert abs(page.evaluate('scrollY') - scroll_top) < 2
+            page.evaluate('window.scrollTo(0, 0)')
+            page.locator('.release-table-wrap').evaluate('el => { el.scrollLeft = 0; }')
             page.set_viewport_size({'width': 390, 'height': 844})
             assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
             expect(blue_cell).to_be_visible()
@@ -236,7 +241,7 @@ with tempfile.TemporaryDirectory(prefix='table42-browser-') as directory:
             page.set_viewport_size({'width': 1280, 'height': 720})
             if destination:
                 page.screenshot(path=str(screenshots / 'director-board.png'), full_page=True)
-            page.get_by_role('button', name='Open inject: Initial alert', exact=True).click()
+            page.get_by_role('link', name='Open inject: Initial alert', exact=True).click()
             expect(page.get_by_role('tab', name='Injects & responses', exact=True)).to_have_attribute('aria-selected', 'true')
             expect(page.get_by_role('link', name='evidence.txt')).to_be_visible()
             if destination := os.getenv('TABLE42_SCREENSHOT_DIR'):
@@ -251,8 +256,9 @@ with tempfile.TemporaryDirectory(prefix='table42-browser-') as directory:
             download = download_info.value
             assert download.suggested_filename.endswith('.zip')
             assert download.failure() is None
-            page.get_by_role('button', name='Unpublish').click()
-            expect(page.get_by_role('button', name='Publish inject', exact=True)).to_be_visible()
+            page.get_by_role('button', name='Unpublish for all', exact=True).click()
+            expect(page.get_by_role('button', name='Publish for all', exact=True)).to_be_visible()
+            expect(page.locator('.inject-head .badge').first).to_have_text('draft')
             alice.get_by_role('button', name='Refresh', exact=True).first.click()
             expect(alice.get_by_role('heading', name='Waiting for the next inject')).to_be_visible()
             assert not errors, errors

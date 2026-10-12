@@ -1,8 +1,11 @@
+import { getDraft, saveDraft, clearDraft, filledCount } from './drafts.js';
+
 const root = document.querySelector('#app');
 const editor = document.querySelector('#editor');
-const state = { user: null, csrf: '', exercise: null, board: null, selected: null, responses: [], tab: 'injects', dirty: false, filter: '', preview: false, previewDrafts: true, previewGroup: '', previewAnswers: {}, previewVariants: {} };
+const state = { user: null, csrf: '', exercise: null, board: null, selected: null, responses: [], tab: 'injects', dirty: false, filter: '', preview: false, previewDrafts: true, previewGroup: '', previewAnswers: {}, previewVariants: {}, boardTarget: '', boardSearch: '', participantFilter: 'all', participantBrowser: false, draftPersisted: true };
 let noticeTimer;
 let loading = false;
+let queuedLoad = null;
 
 const esc = (value = '') => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const field = (name, label, value = '', type = 'text', extra = '') => `<div class="field"><label for="${name}">${label}</label><input id="${name}" name="${name}" type="${type}" value="${esc(value)}" ${extra}></div>`;
@@ -57,10 +60,10 @@ async function run(form, action) {
 
 function shell(content, active = 'exercises') {
   const admin = state.user.is_admin;
-  root.innerHTML = `<div class="shell"><aside class="sidebar"><div><a class="brand" href="#"><img src="/static/range42-logo.svg" alt="Range42 logo">Table42</a><p class="eyebrow">Range42 tabletop exercises</p></div>
+  root.innerHTML = `<a class="skip-link" href="#main-content" data-action="skip-content">Skip to main content</a><div class="shell"><aside class="sidebar"><div><a class="brand" href="#"><img src="/static/range42-logo.svg" alt="Range42 logo">Table42</a><p class="eyebrow">Range42 tabletop exercises</p></div>
     <nav class="nav" aria-label="Main navigation"><a href="#" class="${active === 'exercises' ? 'active' : ''}">◇ &nbsp; Exercises</a>${admin ? `<a href="#users" class="${active === 'users' ? 'active' : ''}">○ &nbsp; People</a>` : ''}</nav>
     <div class="sidebar-bottom"><strong>${esc(state.user.name)}</strong><p>${admin ? 'Administrator' : 'Exercise participant'}</p><div class="row"><a class="button small ghost" href="#account">Account</a><button class="small ghost" data-action="logout">Sign out</button></div></div></aside>
-    <div class="workspace"><header class="topbar"><strong>Exercise workspace</strong><span>Range42 / Table42</span></header><main class="content">${content}</main></div></div>`;
+    <div class="workspace"><header class="topbar"><strong>Exercise workspace</strong><span>Range42 / Table42</span></header><main id="main-content" class="content" tabindex="-1">${content}</main></div></div>`;
 }
 
 function auth(needsSetup) {
@@ -80,23 +83,29 @@ async function dashboard() {
       : empty(state.user.is_admin ? 'Set the scene' : 'No exercises assigned yet', state.user.is_admin ? 'Create an exercise, add your groups, and prepare the first inject.' : 'Your director will add you to an exercise. Refresh this page when you are ready.', create)}`);
 }
 
-async function exercisePage(id, quiet = false, section = '') {
+async function exercisePage(id, quiet = false, section = '', requestedInject = null) {
   const exercise = await api(`/exercises/${id}`);
-  if (state.exercise?.id !== exercise.id) { state.selected = null; state.tab = exercise.is_director ? 'board' : 'injects'; state.filter = ''; state.previewDrafts = true; state.previewGroup = ''; state.previewAnswers = {}; state.previewVariants = {}; }
-  if (quiet && (state.dirty || editor.open)) return;
+  if (state.exercise?.id !== exercise.id) { state.selected = null; state.tab = exercise.is_director ? 'board' : 'injects'; state.filter = ''; state.previewDrafts = true; state.previewGroup = ''; state.previewAnswers = {}; state.previewVariants = {}; state.boardTarget = ''; state.boardSearch = ''; state.participantFilter = 'all'; state.participantBrowser = false; }
+  if (quiet && (state.dirty || editor.open || document.activeElement?.matches('input,select,textarea'))) {
+    if (!exercise.is_director) updateParticipantAvailability(exercise);
+    return;
+  }
   if (exercise.is_director && ['board', 'injects', 'people'].includes(section)) state.tab = section;
   const focusedCell = document.activeElement?.closest('.release-cell');
   const boardScroll = document.querySelector('.release-table-wrap')?.scrollLeft || 0;
-  const boardScrollTop = document.querySelector('.release-table-wrap')?.scrollTop || 0;
+  const pageScroll = window.scrollY;
+  const focusedControl = document.activeElement?.id;
   state.exercise = exercise;
   state.preview = section === 'preview' && exercise.is_director;
+  if (requestedInject) state.selected = requestedInject;
   if (state.preview) { previewPage(); return; }
-  if (!exercise.injects.some(i => i.id === state.selected)) state.selected = exercise.injects[0]?.id ?? null;
+  if ((!requestedInject || exercise.is_director) && !exercise.injects.some(i => i.id === state.selected)) state.selected = exercise.injects[0]?.id ?? null;
   const director = exercise.is_director;
-  state.responses = state.selected && (!director || state.tab === 'injects') ? await api(`/injects/${state.selected}/responses`) : [];
+  const available = exercise.injects.some(inject => inject.id === state.selected);
+  state.responses = available && (!director || state.tab === 'injects') ? await api(`/injects/${state.selected}/responses`) : [];
   if (director && state.tab === 'board') state.board = await api(`/exercises/${id}/board`);
   const statusAction = exercise.status === 'live' ? ['closed', 'Close exercise'] : ['live', exercise.status === 'closed' ? 'Reopen exercise' : 'Start exercise'];
-  const controls = director ? `<div><div class="row"><a class="button" href="#exercise/${id}/preview">Preview exercise</a><a class="button" href="/api/exercises/${id}/export.zip">↓ Export results</a><button data-action="edit-exercise">Edit</button><button class="primary" data-action="status" data-status="${statusAction[0]}">${statusAction[1]}</button></div><small class="muted">Export includes CSV, JSON, and all attachments.</small></div>` : '<button data-action="refresh">Refresh</button>';
+  const controls = director ? `<div><div class="row"><a class="button" href="#exercise/${id}/preview">Preview exercise</a><a class="button" href="/api/exercises/${id}/export.zip">↓ Export results</a><button data-action="edit-exercise">Edit</button><button data-action="clone-exercise">Clone exercise</button><button class="primary" data-action="status" data-status="${statusAction[0]}">${statusAction[1]}</button></div><small class="muted">Export includes CSV, JSON, and all attachments.</small></div>` : '<button data-action="refresh">Refresh</button>';
   shell(`<div class="page-head"><div><p class="eyebrow"><a href="#">Exercises</a> / Exercise room</p><div class="row"><h1>${esc(exercise.name)}</h1>${badge(exercise.status)}</div><p class="muted text">${esc(exercise.description)}</p></div>${controls}</div>
     ${exercise.status === 'draft' ? '<div class="banner">This exercise is being prepared. Participants will see published injects when the director starts the exercise.</div>' : ''}
     ${exercise.status === 'closed' ? '<div class="banner">The exercise is closed. Responses remain available for review and export.</div>' : ''}
@@ -105,32 +114,48 @@ async function exercisePage(id, quiet = false, section = '') {
   const boardTable = document.querySelector('.release-table-wrap');
   if (boardTable) {
     boardTable.scrollLeft = boardScroll;
-    boardTable.scrollTop = boardScrollTop;
+
     if (focusedCell) [...boardTable.querySelectorAll('.release-cell')].find(cell =>
       cell.dataset.id === focusedCell.dataset.id && cell.dataset.targetKey === focusedCell.dataset.targetKey
     )?.focus({ preventScroll: true });
   }
-  focusInjectSequence();
+  if (focusedControl) document.getElementById(focusedControl)?.focus({ preventScroll: true });
+  window.scrollTo({ top: pageScroll, behavior: 'instant' });
+}
+
+const releaseLabels = { unpublished: 'Unpublished', published: 'Published', answered: 'Answered' };
+
+function boardTargets() {
+  return state.board.targets.filter(target => !state.boardTarget || target.key === state.boardTarget);
+}
+
+function boardInjects() {
+  const query = state.boardSearch.trim().toLocaleLowerCase();
+  return state.board.injects.filter(inject => !query || `${inject.name} ${inject.session_time}`.toLocaleLowerCase().includes(query));
+}
+
+function boardRows() {
+  const targets = boardTargets();
+  const injects = boardInjects();
+  if (!injects.length) return `<tr><td colspan="${targets.length + 1}"><p class="muted">No injects match your search.</p></td></tr>`;
+  return injects.map(inject => `<tr data-inject-id="${inject.id}"><th scope="row"><div class="release-inject"><span class="release-number">${String(state.board.injects.indexOf(inject) + 1).padStart(2, '0')}</span><div><a class="inject-link" href="#exercise/${state.exercise.id}/injects/${inject.id}" aria-label="Open inject: ${esc(inject.name)}">${esc(inject.name)}</a>${inject.session_time ? `<span class="muted">${esc(inject.session_time)}</span>` : ''}${inject.optional ? '<span class="badge optional">Optional</span>' : ''}<div class="row release-row-actions"><button class="small" data-action="publication" data-id="${inject.id}" data-published="true" title="Publish this inject to every team and individual participant">Publish for all</button><button class="small" data-action="publication" data-id="${inject.id}" data-published="false" title="Hide this inject from everyone while keeping saved replies">Unpublish for all</button></div></div></div></th>${targets.map(target => {
+    const cell = inject.cells.find(item => item.target_key === target.key);
+    const label = releaseLabels[cell.status];
+    const action = cell.published ? 'Unpublish' : 'Publish';
+    return `<td><button type="button" class="release-cell ${cell.status}" data-action="team-publication" data-id="${inject.id}" data-target-key="${esc(target.key)}" data-target-kind="${target.kind}" data-target-id="${target.id}" data-published="${cell.published}" data-status="${cell.status}" aria-pressed="${cell.published}" aria-label="${esc(`${action} ${inject.name} for ${target.name}. ${label}. ${cell.answered_count} of ${cell.question_count} questions answered.`)}" title="${action} for ${esc(target.name)}"><small class="release-recipient">${esc(target.name)}</small><span class="release-state"><span class="release-dot" aria-hidden="true">${cell.status === 'answered' ? '✓' : ''}</span><strong>${label}</strong></span><span>${cell.question_count ? `${cell.answered_count} / ${cell.question_count} questions` : inject.information_only ? 'Information update' : cell.response_count ? 'Acknowledged' : 'Acknowledgement requested'}</span><small>${cell.response_count} repl${cell.response_count === 1 ? 'y' : 'ies'}</small></button></td>`;
+  }).join('')}</tr>`).join('');
 }
 
 function directorBoard() {
-  const { targets, injects } = state.board;
-  const labels = { unpublished: 'Unpublished', published: 'Published', answered: 'Answered' };
-  const counts = Object.fromEntries(Object.keys(labels).map(status => [status,
-    injects.reduce((total, inject) => total + inject.cells.filter(cell => cell.status === status).length, 0)
-  ]));
-  const header = `<header class="release-head row between"><div><p class="eyebrow">Exercise direction</p><h2>Release board</h2><p class="muted">Click a cell to publish or unpublish for that team or participant.</p></div><div class="row"><button data-action="refresh">Refresh</button><button class="primary" data-action="new-inject">+ New inject</button></div></header>`;
-  if (!targets.length) return `<section class="card release-board">${header}${empty('Add your teams or participants', 'Assign exercise members to start managing releases for each team or person.', '<button class="primary" data-action="member">+ Assign member</button><button data-action="new-group">+ Add team</button>')}</section>`;
+  const targets = boardTargets();
+  const injects = state.board.injects;
+  const header = `<header class="release-head"><div class="row between"><div><p class="eyebrow">Exercise direction</p><h2>Release board</h2></div><div class="row"><button data-action="refresh">Refresh</button><button data-action="new-inject">+ New inject</button></div></div><div class="row bulk-controls"><button class="primary" data-action="all-publication" data-published="true" ${!injects.length ? 'disabled' : ''}>Publish all injects</button><button data-action="all-publication" data-published="false" ${!injects.length ? 'disabled' : ''}>Unpublish all injects</button><span class="muted">For every team and individual participant. Saved replies are retained.</span></div></header>`;
+  if (!state.board.targets.length) return `<section class="card release-board">${header}${empty('Add your teams or participants', 'Assign exercise members to start managing releases for each team or person.', '<button class="primary" data-action="member">+ Assign member</button><button data-action="new-group">+ Add team</button>')}</section>`;
   if (!injects.length) return `<section class="card release-board">${header}${empty('Prepare your first inject', 'Your injects will appear as rows, with one release control for each team or participant.')}</section>`;
-  return `<section class="card release-board">${header}
-    <div class="release-summary" aria-label="Release status summary">${Object.entries(labels).map(([status, label]) => `<div class="release-stat ${status}"><span class="release-dot" aria-hidden="true"></span><strong>${counts[status]}</strong><span>${label}</span></div>`).join('')}</div>
-    <div class="table-wrap release-table-wrap" tabindex="0" role="region" aria-label="Injects by team and participant, scroll to see all columns"><table class="release-table"><caption class="sr-only">Inject publication and question completion for every team and individual participant</caption><thead><tr><th scope="col">Inject sequence</th>${targets.map(target => `<th scope="col"><strong>${esc(target.name)}</strong><span>${target.kind === 'group' ? `Team · ${target.member_count} member${target.member_count === 1 ? '' : 's'}` : 'Individual participant'}</span></th>`).join('')}</tr></thead><tbody>${injects.map((inject, index) => `<tr><th scope="row"><div class="release-inject"><span class="release-number">${String(index + 1).padStart(2, '0')}</span><div><button class="inject-link" data-action="board-open-inject" data-id="${inject.id}" aria-label="Open inject: ${esc(inject.name)}">${esc(inject.name)}</button>${inject.session_time ? `<span class="muted">${esc(inject.session_time)}</span>` : ''}${inject.optional ? '<span class="badge optional">Optional</span>' : ''}</div></div></th>${inject.cells.map((cell, position) => {
-      const target = targets[position];
-      const label = labels[cell.status];
-      const action = cell.published ? 'Unpublish' : 'Publish';
-      return `<td><button type="button" class="release-cell ${cell.status}" data-action="team-publication" data-id="${inject.id}" data-target-key="${esc(target.key)}" data-target-kind="${target.kind}" data-target-id="${target.id}" data-published="${cell.published}" data-status="${cell.status}" aria-pressed="${cell.published}" aria-label="${esc(`${action} ${inject.name} for ${target.name}. ${label}. ${cell.answered_count} of ${cell.question_count} questions answered.`)}" title="${action} for ${esc(target.name)}"><span class="release-state"><span class="release-dot" aria-hidden="true">${cell.status === 'answered' ? '✓' : ''}</span><strong>${label}</strong></span><span>${cell.question_count ? `${cell.answered_count} / ${cell.question_count} questions` : 'No questions'}</span><small>${cell.response_count} repl${cell.response_count === 1 ? 'y' : 'ies'}</small></button></td>`;
-    }).join('')}</tr>`).join('')}</tbody></table></div>
-    <footer class="release-footer"><p>A team is answered when its saved replies cover every question, including optional questions. Information updates stay orange when published.</p><span>Updates every 15 seconds</span></footer></section>`;
+  return `<section class="card release-board">${header}<div class="release-filters"><div class="field"><label for="board-search">Search injects</label><input id="board-search" name="board_search" type="search" autocomplete="off" value="${esc(state.boardSearch)}" placeholder="Inject name or release time…" data-input="board-search"></div><div class="field"><label for="board-target">Show team</label><select id="board-target" name="board_target" data-change="board-target"><option value="">All teams and participants</option>${state.board.targets.map(target => `<option value="${esc(target.key)}" ${target.key === state.boardTarget ? 'selected' : ''}>${esc(target.name)}</option>`).join('')}</select></div><p id="board-result-count" class="muted" role="status">${boardInjects().length} / ${injects.length} injects</p></div>
+    <p class="table-scroll-hint">Scroll down the page for more injects. Scroll across the table for additional teams.</p>
+    <div class="table-wrap release-table-wrap" tabindex="0" role="region" aria-label="Injects by team and participant, horizontal scrolling only"><table class="release-table"><caption class="sr-only">Inject publication and question completion for every team and individual participant</caption><thead><tr><th scope="col">Inject and release for everyone</th>${targets.map(target => `<th scope="col"><strong>${esc(target.name)}</strong><span>${target.kind === 'group' ? `Team · ${target.member_count} member${target.member_count === 1 ? '' : 's'}` : 'Individual participant'}</span></th>`).join('')}</tr></thead><tbody>${boardRows()}</tbody></table></div>
+    <footer class="release-footer"><p>Grey: unpublished · Orange: published · Green: all questions answered.<br>Unpublishing hides injects without deleting replies, revision history, or attachments.</p><button class="small" data-action="board-top">Back to board controls</button></footer></section>`;
 }
 
 function peoplePanel() {
@@ -145,11 +170,6 @@ function injectNavigation(injects, preview = false) {
     <div class="mobile-inject-select field"><label for="inject-picker">Choose inject</label><select id="inject-picker" data-change="inject-picker">${options(injects, state.selected)}</select></div><div class="inject-items">${injects.map((item, index) => `<button class="inject-item ${item.id === state.selected ? 'active' : ''}" data-action="select-inject" data-id="${item.id}"><div class="row">${badge(item.published ? 'published' : 'draft')}${item.optional ? badge('optional') : ''}</div><strong>${index + 1}. ${esc(item.name)}</strong><span class="muted">${item.information_only ? 'Information update' : `${item.questions.length} question${item.questions.length === 1 ? '' : 's'}`}${!preview && state.exercise.is_director ? ` · ${item.response_count} replies` : ''}${item.session_time ? `<br>${esc(item.session_time)}` : ''}</span></button>`).join('')}</div>${!injects.length ? '<p class="muted">No injects in this view.</p>' : ''}</aside>`;
 }
 
-function focusInjectSequence() {
-  const list = document.querySelector('.inject-items');
-  const selected = list?.querySelector('.active');
-  if (selected && list.clientHeight) list.scrollTop += selected.getBoundingClientRect().top - list.getBoundingClientRect().top - list.clientHeight / 3;
-}
 
 function variantPicker(inject, preview = false) {
   const variants = Object.entries(inject.variants || {});
@@ -183,13 +203,105 @@ function previewPage() {
     <section class="inject-panel">${inject ? `<div class="card">${variantPicker(inject, true)}<header class="inject-head">${badge(inject.published ? 'published' : 'draft')}<h2>${esc(inject.name)}</h2>${inject.sender ? `<p class="muted">From: <strong>${esc(inject.sender)}</strong></p>` : ''}<p class="text">${esc(inject.description)}</p></header>${attachmentList(inject.attachments)}</div>
       ${inject.information_only ? '<div class="card"><p class="muted">Information update — no response requested.</p></div>' : `<div class="card"><h2>Reply to this inject</h2><p class="muted">Submitted by <strong>Example participant</strong>${group ? ` for <strong>${esc(group.name)}</strong>` : ''}. Each person submits a named reply for their group.</p><form data-form="preview-response">${errorSlot}${inject.questions.map(question => questionInput(question, state.previewAnswers[inject.id]?.[question.id])).join('')}<div class="preview-feedback" role="status" data-preview-feedback hidden></div><div class="row between"><span class="muted">Try the questions without saving a response.</span><button class="primary" type="submit">Check response</button></div></form><p class="muted preview-evidence">Participants can attach supporting files after submitting a response.</p></div>`}`
       : empty(state.previewDrafts ? 'No injects to preview' : 'No published injects', state.previewDrafts ? 'Return to the exercise to prepare your first inject.' : 'Enable “Include unpublished injects” to preview the drafts.')}</section></div>`);
-  focusInjectSequence();
 }
 
 function injectPanel() {
   const ex = state.exercise;
+  if (!ex.is_director) return participantPanel();
   const inject = ex.injects.find(i => i.id === state.selected);
   return `<div class="exercise-grid">${injectNavigation(ex.injects)}<section class="inject-panel">${inject ? injectDetail(inject) : empty(ex.is_director ? 'Prepare your first inject' : 'Waiting for the next inject', ex.is_director ? 'Give it a name, set the scene, and add the questions you want the room to consider.' : 'Published injects will appear here when your director releases them.', ex.is_director ? '<button class="primary" data-action="new-inject">+ New inject</button>' : '<button data-action="refresh">Refresh</button>')}</section></div>`;
+}
+
+function participantStatus(inject) {
+  if (inject.information_only) return 'Information update';
+  if (inject.team_progress?.complete) return 'Answered';
+  return inject.team_progress?.response_count ? 'In progress' : 'Awaiting response';
+}
+
+function participantInjects() {
+  return state.exercise.injects.filter(inject => state.participantFilter === 'all' ||
+    (state.participantFilter === 'information' ? inject.information_only : !inject.information_only &&
+      (state.participantFilter === 'answered' ? inject.team_progress?.complete : !inject.team_progress?.complete)));
+}
+
+function participantPanel() {
+  const ex = state.exercise;
+  const inject = ex.injects.find(item => item.id === state.selected);
+  const group = ex.groups.find(item => item.id === ex.membership?.group_id);
+  const requested = ex.injects.filter(item => !item.information_only);
+  const completed = requested.filter(item => item.team_progress?.complete).length;
+  const index = ex.injects.findIndex(item => item.id === state.selected);
+  const pending = requested.find(item => !item.team_progress?.complete);
+  const visible = participantInjects();
+  return `<section class="participant-summary"><div><p class="eyebrow">Participant workspace</p><h2>Your workspace</h2><p><strong>${esc(state.user.name)}</strong>${group ? ` · ${esc(group.name)}` : ' · Individual responses'}</p><p class="muted">${group ? 'Team progress includes saved replies from your team, with each author recorded.' : 'Your replies stay attributed to you. Track completed injects below.'}</p></div><div class="participant-metrics"><div><strong>${ex.injects.length}</strong><span>Available injects</span></div><div data-team-completion><strong>${completed} / ${requested.length}</strong><span>${group ? 'Team' : 'Your'} injects answered</span></div><div><strong>${requested.length - completed}</strong><span>Awaiting response</span></div></div></section>
+    <div class="participant-browse row between"><div class="row"><button data-action="toggle-inject-browser" aria-expanded="${state.participantBrowser}" aria-controls="participant-inject-browser">${state.participantBrowser ? 'Close inject browser' : 'Browse injects'}</button><div class="field"><label for="participant-filter">Show injects</label><select id="participant-filter" name="participant_filter" data-change="participant-filter">${[['all', 'All available'], ['pending', 'Awaiting response'], ['answered', 'Answered'], ['information', 'Information updates']].map(([value, label]) => `<option value="${value}" ${state.participantFilter === value ? 'selected' : ''}>${label}</option>`).join('')}</select></div></div><button data-action="next-pending" ${!pending ? 'disabled' : ''}>Next awaiting response</button></div>
+    <div id="participant-inject-browser" class="participant-inject-list" ${state.participantBrowser ? '' : 'hidden'}>${visible.length ? visible.map(item => `<button class="inject-item ${item.id === state.selected ? 'active' : ''} ${item.team_progress?.complete ? 'answered' : ''}" data-action="select-inject" data-id="${item.id}"><strong>${esc(item.name)}</strong><span>${participantStatus(item)}</span><small>${item.information_only ? 'No reply requested' : `${item.team_progress?.answered_count || 0} / ${item.questions.length} questions answered`}${item.my_progress?.response_count ? ' · Your reply saved' : ''}</small></button>`).join('') : '<p class="muted">No injects in this filter.</p>'}</div>
+    <p id="participant-live-status" class="banner" role="status" hidden></p>
+    <section class="participant-panel">${inject ? `<nav class="participant-toolbar row between" aria-label="Inject navigation"><span>Inject ${index + 1} of ${ex.injects.length} · <strong>${participantStatus(inject)}</strong></span><div class="row"><button class="small" data-action="previous-inject" ${index <= 0 ? 'disabled' : ''}>Previous inject</button><button class="small" data-action="next-inject" ${index === ex.injects.length - 1 ? 'disabled' : ''}>Next inject</button>${!inject.information_only ? '<button class="small primary" data-action="go-to-questions">Go to questions</button>' : ''}</div></nav>${participantInjectDetail(inject)}` : empty('Waiting for the next inject', 'Released injects will appear here. Your saved replies and local drafts are kept when an inject is unpublished.', '<button data-action="refresh">Refresh</button>')}</section>`;
+}
+
+function participantInjectDetail(inject) {
+  const ex = state.exercise;
+  const mine = state.responses.find(reply => reply.user_id === state.user.id);
+  const group = mine?.group_name || ex.groups.find(item => item.id === ex.membership?.group_id)?.name;
+  const draft = !inject.information_only && getDraft(state.user, ex, inject);
+  const answers = draft?.answers || mine?.answers || {};
+  const revision = draft ? draft.revision : mine?.revision || 0;
+  const conflict = draft && draft.revision !== (mine?.revision || 0);
+  const canReply = ex.status === 'live' && inject.published && !inject.information_only;
+  state.dirty = Boolean(draft);
+  state.draftPersisted = !draft || draft.persisted;
+  const scenario = `<article class="card participant-situation" data-inject-id="${inject.id}"><header class="inject-head"><p class="eyebrow">${inject.information_only ? 'Situation update' : 'Situation & questions'}</p><h2 tabindex="-1">${esc(inject.name)}</h2>${inject.sender ? `<p class="muted">From: <strong>${esc(inject.sender)}</strong></p>` : ''}<p class="text">${esc(inject.description)}</p></header>${inject.attachments.length ? `<details class="inject-material" open><summary>Exercise material (${inject.attachments.length})</summary>${attachmentList(inject.attachments)}</details>` : ''}${inject.information_only ? '<p class="muted">Information update — no response requested.</p>' : ''}</article>`;
+  if (inject.information_only) return scenario;
+  return `${scenario}<section id="reply-card" class="card participant-reply"><div class="row between"><h2>Your reply</h2><span class="muted">${mine ? `Saved · revision ${mine.revision}` : 'No submitted reply yet'}</span></div><p class="muted">Submitted by <strong>${esc(state.user.name)}</strong>${group ? ` for <strong>${esc(group)}</strong>` : ''}. Your name stays attached to the reply.</p>
+    <form id="reply-form" data-form="response" data-revision="${revision}" data-inject-id="${inject.id}" autocomplete="off">${errorSlot}<p class="banner" data-draft-conflict ${conflict ? '' : 'hidden'}>A newer response is saved. Your local draft is still here. Review the saved reply before submitting.</p><fieldset class="response-fields" ${canReply ? '' : 'disabled'}><legend class="sr-only">Your answers</legend>${inject.questions.length ? inject.questions.map(question => questionInput(question, answers[question.id])).join('') : '<p>Acknowledge that you have read this inject by submitting a reply.</p>'}</fieldset><div class="reply-status"><strong data-question-progress aria-live="polite">${filledCount(inject.questions, answers)} / ${inject.questions.length} questions filled</strong><span data-draft-status role="status">${draft ? draft.persisted ? 'Draft saved in this browser. Not submitted.' : 'Draft kept in this tab. Submit before closing to keep it.' : mine ? `Last saved ${esc(date(mine.updated_at))}` : 'Answers are kept in this browser as you type. Submit to share them with your team.'}</span></div><div class="row between"><button type="button" class="small" data-action="discard-draft" ${draft ? '' : 'hidden'}>Discard local draft</button><button class="primary" type="submit" ${canReply ? '' : 'disabled'}>${mine ? 'Save changes' : 'Submit response'}</button></div>${!canReply ? '<p class="muted">Replies are currently closed. Saved replies and local drafts are retained.</p>' : ''}</form>
+    ${mine ? attachmentList(mine.attachments) + (canReply ? uploadForm('responses', mine.id) : '') : '<p class="muted">You can attach supporting files after submitting your response.</p>'}</section>
+    <details class="card team-replies"><summary>${ex.membership?.group_id ? 'Team replies' : 'Saved replies'} (${state.responses.length})</summary><p class="muted">Every reply keeps the author and team recorded at submission.</p><div id="response-list">${responseList(inject)}</div></details>`;
+}
+
+function rememberDraft(form = document.querySelector('[data-form="response"]')) {
+  const inject = state.exercise?.injects.find(item => item.id === Number(form?.dataset.injectId || state.selected));
+  if (!form || !inject || state.exercise.is_director) return;
+  if (form.querySelector('.response-fields')?.disabled) return;
+  const answers = readAnswers(form, inject);
+  state.draftPersisted = saveDraft(state.user, state.exercise, inject, answers, Number(form.dataset.revision));
+  const status = form.querySelector('[data-draft-status]');
+  const message = state.draftPersisted ? 'Draft saved in this browser. Not submitted.' : 'Draft kept in this tab. Submit before closing to keep it.';
+  if (status && status.textContent !== message) status.textContent = message;
+  const progress = form.querySelector('[data-question-progress]');
+  if (progress) progress.textContent = `${filledCount(inject.questions, answers)} / ${inject.questions.length} questions filled`;
+  form.querySelector('[data-action="discard-draft"]')?.removeAttribute('hidden');
+}
+
+function updateParticipantAvailability(exercise) {
+  const note = document.querySelector('#participant-live-status');
+  const current = exercise.injects.find(inject => inject.id === state.selected);
+  const form = document.querySelector('[data-form="response"]');
+  const submit = form?.querySelector('[type="submit"]');
+  const paused = !current || exercise.status !== 'live';
+  if (submit) submit.disabled = paused;
+  if (note) {
+    const added = exercise.injects.filter(inject => !state.exercise.injects.some(item => item.id === inject.id)).length;
+    note.hidden = !paused && !added;
+    note.textContent = paused ? 'Replies are paused for this inject. Your saved reply and local draft are kept.' :
+      `${added} newly released inject${added === 1 ? '' : 's'}. Refresh when you are ready to see them.`;
+  }
+  const conflict = form?.querySelector('[data-draft-conflict]');
+  if (conflict && current) conflict.hidden = Number(form.dataset.revision) === current.my_progress.revision;
+}
+
+async function selectInject(id) {
+  if (!allowDiscard()) return;
+  state.selected = Number(id);
+  state.filter = '';
+  state.participantBrowser = false;
+  history.pushState(null, '', `#exercise/${state.exercise.id}/${state.preview ? 'preview' : 'injects'}/${state.selected}`);
+  await load();
+  const panel = document.querySelector('.participant-panel, .inject-panel');
+  panel?.scrollIntoView({ block: 'start', behavior: 'instant' });
+  const heading = panel?.querySelector('h2');
+  heading?.setAttribute('tabindex', '-1');
+  heading?.focus({ preventScroll: true });
 }
 
 function attachmentList(attachments) {
@@ -202,7 +314,7 @@ function attachmentList(attachments) {
 }
 
 function uploadForm(kind, id) {
-  return `<form class="upload" data-form="upload" data-kind="${kind}" data-id="${id}">${errorSlot}<label for="upload-${kind}-${id}">${kind === 'injects' ? 'Attach inject material' : 'Attach supporting evidence'}</label><p class="muted">Images, video, audio, documents, or text. Choose one or more files.</p><input id="upload-${kind}-${id}" type="file" name="files" multiple required><button class="small" type="submit">Upload files</button></form>`;
+  return `<form class="upload" data-form="upload" data-kind="${kind}" data-id="${id}">${errorSlot}<label for="upload-${kind}-${id}">${kind === 'injects' ? 'Attach inject material' : 'Attach supporting evidence'}</label><p class="muted">Images, video, audio, documents, or text. Choose one or more files.</p><input id="upload-${kind}-${id}" type="file" name="files" multiple required><div class="row upload-actions"><button class="small" type="submit">Upload files</button><button class="small" type="button" data-action="clear-upload" disabled>Clear selected files</button></div></form>`;
 }
 
 function questionInput(q, answer) {
@@ -230,10 +342,11 @@ function listItem(id, label, index, value = '', required = false) {
 
 function injectDetail(inject) {
   const ex = state.exercise;
+  if (!ex.is_director) return participantInjectDetail(inject);
   const mine = state.responses.find(r => r.user_id === state.user.id);
   const canReply = ex.status === 'live' && inject.published && !inject.information_only;
   const group = mine ? mine.group_name : ex.groups.find(g => g.id === ex.membership?.group_id)?.name;
-  return `<div class="card"><header class="inject-head"><div class="row between"><div class="row">${badge(inject.published ? 'published' : 'draft')}${inject.optional ? badge('optional') : ''}</div>${ex.is_director ? `<div class="row"><button class="small" data-action="edit-inject">Edit inject</button><button class="small ${inject.published ? '' : 'primary'}" data-action="publication">${inject.published ? 'Unpublish' : 'Publish inject'}</button></div>` : ''}</div><h2>${esc(inject.name)}</h2>${inject.sender ? `<p class="muted">From: <strong>${esc(inject.sender)}</strong></p>` : ''}${ex.is_director && inject.session_time ? `<p class="muted">Planned release: ${esc(inject.session_time)}</p>` : ''}${ex.is_director ? variantPicker(inject) : ''}<p class="text">${esc(inject.description)}</p></header>
+  return `<div class="card"><header class="inject-head"><div class="row between"><div class="row">${badge(inject.published ? 'published' : 'draft')}${inject.optional ? badge('optional') : ''}</div>${ex.is_director ? `<div class="row"><button class="small" data-action="edit-inject">Edit inject</button><button class="small primary" data-action="publication" data-id="${inject.id}" data-published="true">Publish for all</button><button class="small" data-action="publication" data-id="${inject.id}" data-published="false">Unpublish for all</button></div>` : ''}</div><h2>${esc(inject.name)}</h2>${inject.sender ? `<p class="muted">From: <strong>${esc(inject.sender)}</strong></p>` : ''}${ex.is_director && inject.session_time ? `<p class="muted">Planned release: ${esc(inject.session_time)}</p>` : ''}${ex.is_director ? variantPicker(inject) : ''}<p class="text">${esc(inject.description)}</p></header>
     ${attachmentList(inject.attachments)}${ex.is_director && ex.status !== 'closed' ? uploadForm('injects', inject.id) : ''}
     ${inject.information_only ? '<p class="muted">Information update — no response requested.</p>' : ''}
     ${ex.is_director ? `<h3>Questions</h3>${inject.questions.length ? inject.questions.map(q => `<div class="question-preview"><strong>${esc(q.label)}</strong><small>${types[q.type]}${q.required ? ' · Required' : ''}${q.max_words ? ` · Up to ${q.max_words} words` : ''}</small>${q.options.length ? `<small>${esc(q.options.join(' / '))}</small>` : ''}${q.type === 'matrix' ? `<small>${q.rows.length} rows · ${q.columns.length} columns</small>` : ''}</div>`).join('') : `<p class="muted">${inject.information_only ? 'No questions for this update.' : 'Participants can acknowledge this inject by submitting a reply.'}</p>`}${inject.facilitator_notes ? `<details class="facilitator-notes"><summary>Director notes</summary><p class="muted">Visible only to exercise directors.</p><div class="text">${esc(inject.facilitator_notes)}</div></details>` : ''}` : ''}</div>
@@ -270,7 +383,7 @@ function accountPage() {
 }
 
 async function load(quiet = false) {
-  if (loading) return;
+  if (loading) { queuedLoad = queuedLoad === null ? quiet : queuedLoad && quiet; return; }
   loading = true;
   try {
     if (!state.user) {
@@ -279,12 +392,15 @@ async function load(quiet = false) {
       if (!state.user) { auth(session.needs_setup); return; }
     }
     const route = location.hash.slice(1).split('/');
-    if (route[0] === 'exercise' && /^\d+$/.test(route[1])) await exercisePage(Number(route[1]), quiet, route[2] || '');
+    if (route[0] === 'exercise' && /^\d+$/.test(route[1])) await exercisePage(Number(route[1]), quiet, route[2] || '', /^[1-9]\d*$/.test(route[3] || '') ? Number(route[3]) : null);
     else if (route[0] === 'users' && state.user.is_admin) await usersPage();
     else if (route[0] === 'account') accountPage();
     else await dashboard();
   } catch (error) { notify(error.message); }
-  finally { loading = false; }
+  finally {
+    loading = false;
+    if (queuedLoad !== null) { const quietAgain = queuedLoad; queuedLoad = null; queueMicrotask(() => load(quietAgain)); }
+  }
 }
 
 function dialog(title, body, formName, data = '') {
@@ -317,8 +433,14 @@ async function memberDialog(id) {
   dialog(member ? 'Edit exercise member' : 'Assign exercise member', `<div class="field"><label for="member-user">Person</label><select id="member-user" name="user_id" required>${options(users, member?.user_id)}</select></div><div class="form-grid"><div class="field"><label for="member-role">Exercise role</label><select id="member-role" name="role"><option value="participant">Participant</option><option value="director" ${member?.role === 'director' ? 'selected' : ''}>Director</option></select></div><div class="field"><label for="member-group">Group</label><select id="member-group" name="group_id"><option value="">No group</option>${options(state.exercise.groups, member?.group_id)}</select></div></div><p class="muted">Directors can prepare and publish injects, review all replies, and export this exercise. Participants can reply and review their group's replies.</p>`, 'member');
 }
 
+function pendingUploads() {
+  return [...document.querySelectorAll('input[type=file]')].some(input => input.files.length);
+}
+
 function allowDiscard() {
-  if (!state.dirty || confirm('Discard unsaved response changes?')) { state.dirty = false; return true; }
+  if (pendingUploads()) { notify('Upload or clear selected files before leaving this view.'); return false; }
+  if (state.dirty) rememberDraft();
+  if (!state.dirty || state.draftPersisted || confirm('This draft could not be stored in this browser. Leave without submitting it?')) { state.dirty = false; return true; }
   return false;
 }
 
@@ -331,6 +453,7 @@ document.addEventListener('click', event => {
     const inject = ex?.injects.find(i => i.id === state.selected);
     if (action === 'logout' && allowDiscard()) { await api('/logout', {}); state.user = null; state.csrf = ''; location.hash = ''; await load(); }
     else if (action === 'new-exercise' || action === 'edit-exercise') dialog(action === 'new-exercise' ? 'New exercise' : 'Edit exercise', field('name', 'Exercise name', action === 'edit-exercise' ? ex.name : '', 'text', 'required maxlength="160"') + textarea('description', 'Description', action === 'edit-exercise' ? ex.description : '', 'maxlength="20000"'), 'exercise', `data-id="${action === 'edit-exercise' ? ex.id : ''}"`);
+    else if (action === 'clone-exercise' && allowDiscard()) dialog('Clone exercise', `${field('name', 'Clone exercise name', ex.name.slice(0, 153) + ' (copy)', 'text', 'required maxlength="160"')}<p class="muted">Create a new draft with the same injects, questions, and exercise material. Injects start unpublished. Replies and uploaded response evidence stay with the original exercise.</p><label class="check"><input name="include_groups" type="checkbox" checked> Copy groups</label><label class="check"><input name="include_users" type="checkbox"> Copy user assignments</label><p class="muted">User assignments reuse existing accounts and exercise roles. If groups are excluded, copied people are ungrouped. You will be a director of the clone.</p>`, 'clone', `data-id="${ex.id}"`);
     else if (action === 'new-user') dialog('Create local account', field('name', 'Full name', '', 'text', 'required maxlength="120"') + field('username', 'Username', '', 'text', 'required minlength="2" maxlength="80" pattern="[a-zA-Z0-9_.-]+" autocomplete="off"') + field('password', 'Initial password', '', 'password', 'required minlength="10" maxlength="256" autocomplete="new-password"'), 'user');
     else if (action === 'reset-password') dialog('Reset account password', '<p class="muted">This signs the person out of all sessions.</p>' + field('password', 'New password', '', 'password', 'required minlength="10" maxlength="256" autocomplete="new-password"'), 'reset', `data-id="${button.dataset.id}"`);
     else if (action === 'new-group') dialog('Add group', field('name', 'Group name', '', 'text', 'required maxlength="120"'), 'group');
@@ -339,6 +462,7 @@ document.addEventListener('click', event => {
     else if (action === 'new-inject') injectDialog();
     else if (action === 'edit-inject') injectDialog(inject);
     else if (action === 'close-dialog') editor.close();
+    else if (action === 'clear-upload') { button.closest('form').querySelector('input[type=file]').value = ''; button.disabled = true; }
     else if (action === 'add-question') editor.querySelector('#question-editors').insertAdjacentHTML('beforeend', questionEditor());
     else if (action === 'remove-question') button.closest('[data-question]').remove();
     else if (action === 'add-list-item') {
@@ -347,8 +471,27 @@ document.addEventListener('click', event => {
       if (count < Number(list.dataset.max)) button.insertAdjacentHTML('beforebegin', listItem(list.dataset.list, list.dataset.label, count));
       button.hidden = count + 1 >= Number(list.dataset.max);
     }
-    else if (action === 'select-inject' && allowDiscard()) { state.selected = Number(button.dataset.id); state.filter = ''; await load(); }
-    else if (action === 'board-open-inject') { state.selected = Number(button.dataset.id); state.filter = ''; state.tab = 'injects'; location.hash = `exercise/${ex.id}/injects`; }
+    else if (action === 'select-inject') await selectInject(button.dataset.id);
+    else if (action === 'skip-content') { event.preventDefault(); document.querySelector('#main-content')?.focus(); }
+    else if (action === 'board-top') document.querySelector('.release-head')?.scrollIntoView({ block: 'start' });
+    else if (action === 'toggle-inject-browser' && allowDiscard()) { state.participantBrowser = !state.participantBrowser; await load(); }
+    else if (action === 'go-to-questions') {
+      const form = document.querySelector('#reply-form');
+      form?.scrollIntoView({ block: 'start' });
+      form?.querySelector('input,select,textarea,button[type=submit]')?.focus({ preventScroll: true });
+    }
+    else if (action === 'next-pending') {
+      const next = ex.injects.find(item => !item.information_only && !item.team_progress?.complete);
+      if (next) await selectInject(next.id);
+    }
+    else if (action === 'previous-inject' || action === 'next-inject') {
+      const index = ex.injects.findIndex(item => item.id === state.selected);
+      const next = ex.injects[index + (action === 'next-inject' ? 1 : -1)];
+      if (next) await selectInject(next.id);
+    }
+    else if (action === 'discard-draft' && confirm('Discard this local draft and use the latest saved reply?')) {
+      clearDraft(state.user, ex, inject); state.dirty = false; state.draftPersisted = true; await load();
+    }
     else if (action === 'tab' && allowDiscard()) { state.tab = button.dataset.tab; const hash = `#exercise/${ex.id}/${state.tab}`; if (location.hash === hash) await load(); else location.hash = hash; }
     else if (action === 'refresh' && allowDiscard()) await load();
     else if (action === 'team-publication') {
@@ -363,7 +506,17 @@ document.addEventListener('click', event => {
         await load();
       } finally { if (button.isConnected) button.disabled = false; }
     }
-    else if (action === 'publication') { await api(`/injects/${inject.id}/publication`, { published: !inject.published }); notify(inject.published ? 'Inject unpublished.' : 'Inject published.'); await load(); }
+    else if (action === 'publication' || action === 'all-publication') {
+      if (button.disabled) return;
+      button.disabled = true;
+      const published = button.dataset.published === 'true';
+      try {
+        const path = action === 'all-publication' ? `/exercises/${ex.id}/publication` : `/injects/${button.dataset.id}/publication`;
+        await api(path, { published });
+        notify(published ? 'Published for all teams and participants.' : 'Unpublished for everyone. Saved replies are retained.');
+        await load();
+      } finally { if (button.isConnected) button.disabled = false; }
+    }
     else if (action === 'status') {
       if (button.dataset.status === 'closed' && !confirm('Close this exercise? Participants will no longer be able to edit replies.')) return;
       await api(`/exercises/${ex.id}/status`, { status: button.dataset.status }); await load();
@@ -373,6 +526,7 @@ document.addEventListener('click', event => {
 
 document.addEventListener('change', event => {
   const target = event.target;
+  if (target.matches('input[type=file]')) target.closest('form')?.querySelector('[data-action="clear-upload"]')?.toggleAttribute('disabled', !target.files.length);
   if (target.dataset.change === 'question-type') {
     for (const section of target.closest('[data-question]').querySelectorAll('[data-kinds]')) {
       section.hidden = !section.dataset.kinds.split(' ').includes(target.value);
@@ -382,9 +536,19 @@ document.addEventListener('change', event => {
     const section = editor.querySelector('[data-question-section]');
     section.hidden = target.checked;
     for (const question of section.querySelectorAll('fieldset')) question.disabled = target.checked;
+  } else if (target.dataset.change === 'board-target') {
+    state.boardTarget = target.value;
+    run(null, () => load());
+  } else if (target.dataset.change === 'participant-filter') {
+    if (allowDiscard()) {
+      state.participantFilter = target.value;
+      run(null, () => load());
+    } else target.value = state.participantFilter;
   } else if (target.dataset.change === 'inject-picker') {
-    if (allowDiscard()) { state.selected = Number(target.value); state.filter = ''; load(); }
-    else target.value = state.selected;
+    run(null, async () => {
+      await selectInject(target.value);
+      if (target.isConnected) target.value = state.selected;
+    });
   } else if (target.dataset.change === 'preview-variant') {
     state.previewVariants[state.selected] = target.value;
     previewPage();
@@ -429,7 +593,13 @@ document.addEventListener('input', event => {
     counter.classList.toggle('word-limit-exceeded', count > Number(event.target.dataset.maxWords));
     event.target.setAttribute('aria-invalid', String(count > Number(event.target.dataset.maxWords)));
   }
-  if (event.target.closest('[data-form="response"]')) state.dirty = true;
+  if (event.target.dataset.input === 'board-search') {
+    state.boardSearch = event.target.value;
+    document.querySelector('.release-table tbody').innerHTML = boardRows();
+    document.querySelector('#board-result-count').textContent = `${boardInjects().length} / ${state.board.injects.length} injects`;
+  }
+  const responseForm = event.target.closest('[data-form="response"]');
+  if (responseForm) { state.dirty = true; rememberDraft(responseForm); }
   const previewForm = event.target.closest('[data-form="preview-response"]');
   if (previewForm) {
     const inject = state.exercise.injects.find(item => item.id === state.selected);
@@ -465,6 +635,17 @@ document.addEventListener('submit', event => {
       else await load();
       return;
     }
+    if (kind === 'clone') {
+      const result = await api(`/exercises/${form.dataset.id}/clone`, {
+        name: values.name,
+        include_groups: form.querySelector('[name=include_groups]').checked,
+        include_users: form.querySelector('[name=include_users]').checked,
+      });
+      editor.close();
+      location.hash = `exercise/${result.id}/board`;
+      notify('Exercise cloned as a draft. All injects are unpublished.');
+      return;
+    }
     if (kind === 'user') await api('/users', values);
     else if (kind === 'reset') await api(`/users/${form.dataset.id}/password`, values);
     else if (kind === 'password') { await api('/password', values); form.reset(); notify('Password updated.'); return; }
@@ -484,12 +665,13 @@ document.addEventListener('submit', event => {
       const payload = { name: values.name, description: values.description, questions, sender: values.sender, session_time: values.session_time,
         facilitator_notes: values.facilitator_notes, optional: form.querySelector('[name=optional]').checked, information_only: informationOnly };
       const result = await api(form.dataset.id ? `/injects/${form.dataset.id}/details` : `/exercises/${ex.id}/injects`, payload);
-      if (result.id) { state.selected = result.id; state.tab = 'injects'; location.hash = `exercise/${ex.id}/injects`; }
+      if (result.id) { state.selected = result.id; state.tab = 'injects'; location.hash = `exercise/${ex.id}/injects/${state.selected}`; }
     } else if (kind === 'response') {
+      if (pendingUploads()) throw new Error('Upload or clear selected files before saving changes to your response.');
       const inject = ex.injects.find(i => i.id === state.selected);
       const answers = readAnswers(form, inject);
       await api(`/injects/${inject.id}/responses`, { revision: Number(form.dataset.revision), answers });
-      state.dirty = false; notify('Response saved with your name and group.');
+      clearDraft(state.user, ex, inject); state.dirty = false; state.draftPersisted = true; notify('Response saved with your name and group.');
     } else if (kind === 'upload') {
       const files = [...form.querySelector('[type=file]').files];
       let done = 0;
@@ -509,7 +691,7 @@ document.addEventListener('click', event => {
   const link = event.target.closest('a[href^="#"]');
   if (link && !allowDiscard()) event.preventDefault();
 });
-window.addEventListener('beforeunload', event => { if (state.dirty) { event.preventDefault(); event.returnValue = ''; } });
-window.addEventListener('hashchange', () => { state.dirty = false; load(); });
-setInterval(() => { if (state.user && location.hash.startsWith('#exercise/') && !location.hash.endsWith('/preview') && !state.dirty && !editor.open && ![...document.querySelectorAll('input[type=file]')].some(input => input.files.length) && ![...document.querySelectorAll('video,audio')].some(media => !media.paused)) load(true); }, 15000);
+window.addEventListener('beforeunload', event => { if ((state.dirty && !state.draftPersisted) || pendingUploads()) { event.preventDefault(); event.returnValue = ''; } });
+window.addEventListener('hashchange', () => { if (state.dirty) rememberDraft(); state.dirty = false; load(); });
+setInterval(() => { if (state.user && location.hash.startsWith('#exercise/') && !state.preview && !editor.open && ![...document.querySelectorAll('input[type=file]')].some(input => input.files.length) && ![...document.querySelectorAll('video,audio')].some(media => !media.paused)) load(true); }, 15000);
 await load();

@@ -45,6 +45,12 @@ def answered_questions(questions, answers):
     return result
 
 
+def answer_progress(questions, replies):
+    answered = set().union(*(answered_questions(questions, reply) for reply in replies))
+    return {'answered_count': len(answered), 'question_count': len(questions), 'response_count': len(replies),
+            'complete': bool(replies) and len(answered) == len(questions)}
+
+
 def exercise_board(db, eid):
     targets = board_targets(db, eid)
     publications = defaultdict(list)
@@ -61,13 +67,13 @@ def exercise_board(db, eid):
         cells = []
         for target in targets:
             replies = responses[(inject['id'], target['key'])]
-            answered = set().union(*(answered_questions(questions, reply) for reply in replies))
+            progress = answer_progress(questions, replies)
             published = published_for(inject, publications[inject['id']], target['key'])
-            complete = bool(questions) and not inject['information_only'] and len(answered) == len(questions)
+            complete = not inject['information_only'] and progress['complete']
             cells.append({'target_key': target['key'], 'published': published,
                           'status': 'unpublished' if not published else 'answered' if complete else 'published',
-                          'answered_count': len(answered), 'question_count': len(questions),
-                          'response_count': len(replies)})
+                          **{key: progress[key] for key in ('answered_count', 'question_count', 'response_count')}})
         injects.append({key: inject[key] for key in ('id', 'name', 'position', 'session_time', 'optional',
-                                                   'information_only')} | {'cells': cells})
+                                                   'information_only')} | {'cells': cells,
+                    'publication_scope': publication_scope(inject, publications[inject['id']], targets)})
     return {'targets': targets, 'injects': injects}

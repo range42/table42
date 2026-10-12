@@ -11,5 +11,6 @@ test:
 
 browser:
 	uv run --locked --with playwright==1.58.0 python tests/browser_flow.py
+	uv run --locked --with playwright==1.58.0 python tests/browser_ux_flow.py
 
 check: test browser

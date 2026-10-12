@@ -3,6 +3,7 @@ import io
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import tempfile
 import time
@@ -14,10 +15,10 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .board import board_targets, exercise_board, publication_scope, publication_target, published_for
+from .board import answer_progress, board_targets, exercise_board, publication_scope, publication_target, published_for
 from .db import Store, many, one
 from .schemas import (
-    Credentials, ExerciseCreate, GroupCreate, InjectSet, MemberSet, PasswordChange,
+    Credentials, ExerciseClone, ExerciseCreate, GroupCreate, InjectSet, MemberSet, PasswordChange,
     PasswordReset, PreviewAnswers, PublicationSet, Question, ResponseSet, StatusSet, UserCreate, VariantSet, validate_answers,
 )
 from .security import hash_password, token_hash, verify_password
@@ -288,6 +289,9 @@ def create_app(data_dir=None):
             exercise, member, director = exercise_access(db, user, eid)
             rows = many(db, 'SELECT * FROM injects WHERE exercise_id=? ORDER BY position,id', (eid,))
             targets = board_targets(db, eid) if director else None
+            participant_replies = many(db, '''SELECT r.* FROM responses r JOIN injects i ON i.id=r.inject_id
+                WHERE i.exercise_id=? AND (r.user_id=? OR (? IS NOT NULL AND r.group_id=?))''',
+                (eid, user['id'], member['group_id'], member['group_id'])) if not director else []
             injects = []
             for row in rows:
                 inject = inject_with_publication(db, row, member, director, targets)
@@ -299,6 +303,16 @@ def create_app(data_dir=None):
                         variant['attachments'] = attachment_rows(db, inject['id'], variant=key)
                 inject['response_count'] = one(db, 'SELECT COUNT(*) n FROM responses WHERE inject_id=?',
                                                (inject['id'],))['n'] if director else None
+                if not director:
+                    replies = [reply for reply in participant_replies if reply['inject_id'] == inject['id']]
+                    mine = next((reply for reply in replies if reply['user_id'] == user['id']), None)
+                    team = [reply for reply in replies if reply['group_id'] == member['group_id']] if (
+                        member['group_id'] is not None) else [mine] if mine else []
+                    inject['my_progress'] = {**answer_progress(inject['questions'],
+                        [json.loads(mine['answers'])] if mine else []),
+                        'revision': mine['revision'] if mine else 0, 'updated_at': mine['updated_at'] if mine else None}
+                    inject['team_progress'] = answer_progress(inject['questions'],
+                                                            [json.loads(reply['answers']) for reply in team])
                 injects.append(inject)
             members = many(db, '''SELECT m.*, u.name, u.username, g.name group_name FROM members m
                                  JOIN users u ON u.id=m.user_id LEFT JOIN groups g ON g.id=m.group_id
@@ -320,12 +334,83 @@ def create_app(data_dir=None):
             exercise_access(db, actor(db, request), eid, director=True)
             return exercise_board(db, eid)
 
+    @app.post('/api/exercises/{eid}/publication')
+    def exercise_publication(eid: int, payload: PublicationSet, request: Request):
+        with store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            exercise_access(db, actor(db, request), eid, director=True)
+            if payload.group_id is not None or payload.user_id is not None:
+                raise HTTPException(422, 'This control applies to every inject and all participants in the exercise.')
+            count = db.execute('UPDATE injects SET published=? WHERE exercise_id=?',
+                               (int(payload.published), eid)).rowcount
+            db.execute('DELETE FROM inject_publications WHERE inject_id IN '
+                       '(SELECT id FROM injects WHERE exercise_id=?)', (eid,))
+        return {'ok': True, 'inject_count': count}
+
     @app.post('/api/exercises/{eid}/details')
     def edit_exercise(eid: int, payload: ExerciseCreate, request: Request):
         with store.connect() as db:
             exercise_access(db, actor(db, request), eid, director=True)
             db.execute('UPDATE exercises SET name=?,description=? WHERE id=?', (payload.name, payload.description, eid))
         return {'ok': True}
+
+    @app.post('/api/exercises/{eid}/clone', status_code=201)
+    def clone_exercise(eid: int, payload: ExerciseClone, request: Request):
+        copied_files = []
+        try:
+            with store.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                user = actor(db, request)
+                source, membership, _ = exercise_access(db, user, eid, director=True)
+                stamp = now()
+                name = payload.name or source['name'][:153] + ' (copy)'
+                clone_id = db.execute('INSERT INTO exercises(name,description,created_at) VALUES (?,?,?)',
+                                      (name, source['description'], stamp)).lastrowid
+                group_ids = {}
+                if payload.include_groups:
+                    for group in many(db, 'SELECT * FROM groups WHERE exercise_id=? ORDER BY id', (eid,)):
+                        group_ids[group['id']] = db.execute('INSERT INTO groups(exercise_id,name) VALUES (?,?)',
+                                                           (clone_id, group['name'])).lastrowid
+                owner_group = group_ids.get(membership['group_id']) if payload.include_users and membership else None
+                db.execute('INSERT INTO members VALUES (?,?,?,?)', (clone_id, user['id'], 'director', owner_group))
+                if payload.include_users:
+                    for member in many(db, 'SELECT * FROM members WHERE exercise_id=? ORDER BY user_id', (eid,)):
+                        if member['user_id'] != user['id']:
+                            db.execute('INSERT INTO members VALUES (?,?,?,?)',
+                                       (clone_id, member['user_id'], member['role'], group_ids.get(member['group_id'])))
+                columns = ('name', 'description', 'questions', 'position', 'source_key', 'sender', 'session_time',
+                           'facilitator_notes', 'optional', 'information_only', 'variants', 'active_variant')
+                for inject in many(db, 'SELECT * FROM injects WHERE exercise_id=? ORDER BY position,id', (eid,)):
+                    inject_id = db.execute(
+                        f"INSERT INTO injects(exercise_id,created_at,{','.join(columns)}) "
+                        f"VALUES ({','.join('?' for _ in range(len(columns) + 2))})",
+                        (clone_id, stamp, *(inject[column] for column in columns))).lastrowid
+                    material = many(db, 'SELECT * FROM attachments WHERE inject_id=? '
+                                    'AND response_id IS NULL ORDER BY id',
+                                    (inject['id'],))
+                    for attachment in material:
+                        original = store.uploads / attachment['storage_name']
+                        if not original.is_file():
+                            raise HTTPException(409, f"Exercise material is missing: {attachment['filename']}. "
+                                                'Restore the file before cloning.')
+                        storage_name = secrets.token_hex(24) + Path(attachment['storage_name']).suffix
+                        target = store.uploads / storage_name
+                        copied_files.append(target)
+                        shutil.copyfile(original, target)
+                        db.execute('''INSERT INTO attachments(inject_id,filename,storage_name,media_type,size,
+                                      author_id,created_at,variant_key,source_path) VALUES (?,?,?,?,?,?,?,?,?)''',
+                                   (inject_id, attachment['filename'], storage_name, attachment['media_type'],
+                                    attachment['size'], user['id'], stamp, attachment['variant_key'],
+                                    attachment['source_path']))
+                clone = one(db, 'SELECT * FROM exercises WHERE id=?', (clone_id,))
+            return clone
+        except BaseException as error:
+            for path in copied_files:
+                path.unlink(missing_ok=True)
+            if isinstance(error, OSError):
+                raise HTTPException(409, 'Exercise material could not be copied. '
+                                    'Check available storage and try again.') from error
+            raise
 
     @app.post('/api/exercises/{eid}/status')
     def status(eid: int, payload: StatusSet, request: Request):

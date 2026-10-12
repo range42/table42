@@ -45,6 +45,12 @@ class ExerciseCreate(Input):
     description: str = Field(default='', max_length=20000)
 
 
+class ExerciseClone(Input):
+    name: str = Field(default='', max_length=160)
+    include_groups: bool = Field(default=True, strict=True)
+    include_users: bool = Field(default=False, strict=True)
+
+
 class GroupCreate(Input):
     name: str = Field(min_length=1, max_length=120)
 
