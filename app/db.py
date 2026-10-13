@@ -14,6 +14,15 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS login_attempts (
     key TEXT PRIMARY KEY, attempts INTEGER NOT NULL, started_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS oidc_accounts (
+    issuer TEXT NOT NULL, subject TEXT NOT NULL,
+    user_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+    PRIMARY KEY(issuer, subject)
+);
+CREATE TABLE IF NOT EXISTS oidc_flows (
+    state_hash TEXT PRIMARY KEY, expires_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS exercises (
     id INTEGER PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','live','closed')),
