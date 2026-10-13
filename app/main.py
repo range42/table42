@@ -19,10 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from .board import answer_progress, board_targets, exercise_board, publication_scope, publication_target, published_for
 from .db import Store, many, one
 from .schemas import (
-    Credentials, ExerciseClone, ExerciseCreate, GroupCreate, InjectSet, MemberSet, PasswordChange,
+    AccountAccess, Credentials, ExerciseClone, ExerciseCreate, ExternalAccount, GroupCreate, InjectSet, MemberSet, PasswordChange,
     PasswordReset, PreviewAnswers, PublicationSet, Question, ResponseSet, StatusSet, UserCreate, VariantSet, validate_answers,
 )
 from .security import hash_password, token_hash, verify_password
+from .oidc import OIDCSettings, external_account, install_oidc
 from .reports import build_pdf, snapshot
 
 
@@ -54,16 +55,19 @@ def inject_data(row, director=True):
     return result
 
 
-def public_user(row):
-    return {**{k: row[k] for k in ('id', 'username', 'name')}, 'is_admin': bool(row['is_admin'])}
+def public_user(row, db):
+    identity = one(db, 'SELECT enabled FROM oidc_accounts WHERE user_id=?', (row['id'],))
+    return {**{k: row[k] for k in ('id', 'username', 'name')}, 'is_admin': bool(row['is_admin']),
+            'auth_method': 'oidc' if identity else 'local', 'enabled': bool(identity['enabled']) if identity else True}
 
 
-def create_app(data_dir=None):
+def create_app(data_dir=None, *, oidc_settings=None, oidc_transport=None):
     directory = Path(data_dir or os.getenv('RANGE42_DATA_DIR', str(STATIC.parent.parent / 'data')))
     store = Store(directory)
     app = FastAPI(title='Table42', docs_url=None, redoc_url=None, openapi_url=None)
     app.state.store = store
-    secure_cookie = os.getenv('RANGE42_SECURE_COOKIE', 'false').lower() == 'true'
+    oidc_settings = oidc_settings or OIDCSettings.from_environment()
+    secure_cookie = bool(oidc_settings) or os.getenv('RANGE42_SECURE_COOKIE', 'false').lower() == 'true'
     upload_limit = int(os.getenv('RANGE42_MAX_UPLOAD_MB', '100')) * 1024 * 1024
     dummy_hash = hash_password(secrets.token_urlsafe(24))
 
@@ -95,7 +99,8 @@ def create_app(data_dir=None):
     def session(db, request):
         token = request.cookies.get('range42_session', '')
         return one(db, '''SELECT s.*, u.id, u.username, u.name, u.is_admin FROM sessions s
-                          JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?''',
+                          JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?
+                          AND NOT EXISTS(SELECT 1 FROM oidc_accounts o WHERE o.user_id=u.id AND o.enabled=0)''',
                    (token_hash(token), time.time()))
 
     def actor(db, request, admin=False):
@@ -176,7 +181,7 @@ def create_app(data_dir=None):
         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         db.execute('DELETE FROM sessions WHERE expires_at<=?', (time.time(),))
         db.execute('INSERT INTO sessions VALUES (?,?,?,?)', (token_hash(token), user['id'], csrf, time.time() + 43200))
-        response = JSONResponse({'user': public_user(user),
+        response = JSONResponse({'user': public_user(user, db),
                                  'csrf_token': csrf}, status_code=status)
         response.set_cookie('range42_session', token, max_age=43200, httponly=True, secure=secure_cookie,
                             samesite='strict', path='/')
@@ -186,9 +191,10 @@ def create_app(data_dir=None):
     def get_session(request: Request):
         with store.connect() as db:
             user = session(db, request)
-            return {'user': public_user(user) if user else None,
+            return {'user': public_user(user, db) if user else None,
                     'csrf_token': user['csrf_token'] if user else None,
-                    'needs_setup': not bool(one(db, 'SELECT id FROM users LIMIT 1'))}
+                    'needs_setup': not bool(one(db, 'SELECT id FROM users LIMIT 1')),
+                    'oidc_enabled': oidc_settings is not None}
 
     @app.post('/api/setup')
     def setup(payload: UserCreate):
@@ -210,7 +216,8 @@ def create_app(data_dir=None):
                 raise HTTPException(429, 'Too many attempts. Try again in five minutes.')
             user = one(db, 'SELECT * FROM users WHERE username=?', (payload.username.strip(),))
             valid = verify_password(payload.password, user['password_hash'] if user else dummy_hash)
-            if not valid or not user:
+            external = user and one(db, 'SELECT user_id FROM oidc_accounts WHERE user_id=?', (user['id'],))
+            if not valid or not user or external:
                 if not attempt or attempt['started_at'] <= stamp - 300:
                     db.execute('INSERT OR REPLACE INTO login_attempts VALUES (?,?,?)', (key, 1, stamp))
                 else:
@@ -220,6 +227,29 @@ def create_app(data_dir=None):
             old_token = request.cookies.get('range42_session', '')
             db.execute('DELETE FROM sessions WHERE token_hash=?', (token_hash(old_token),))
             return login_response(db, user)
+
+    @app.post('/api/oidc/accounts')
+    def provision_external_account(payload: ExternalAccount, request: Request):
+        with store.connect() as db:
+            actor(db, request, admin=True)
+            if not oidc_settings or payload.issuer != oidc_settings.issuer:
+                raise HTTPException(422, 'Choose the configured exercise identity provider.')
+            db.execute('BEGIN IMMEDIATE')
+            user, _ = external_account(db, payload.issuer, payload.subject, payload.name)
+            return public_user(user, db)
+
+    @app.post('/api/users/{uid}/access')
+    def set_external_account_access(uid: int, payload: AccountAccess, request: Request):
+        with store.connect() as db:
+            actor(db, request, admin=True)
+            if not one(db, 'SELECT user_id FROM oidc_accounts WHERE user_id=?', (uid,)):
+                raise HTTPException(404, 'Externally managed account not found.')
+            db.execute('UPDATE oidc_accounts SET enabled=? WHERE user_id=?', (int(payload.enabled), uid))
+            db.execute('DELETE FROM sessions WHERE user_id=?', (uid,))
+        return {'ok': True}
+
+    if oidc_settings:
+        install_oidc(app, oidc_settings, store, login_response, oidc_transport)
 
     @app.post('/api/logout')
     def logout(request: Request):
@@ -234,7 +264,7 @@ def create_app(data_dir=None):
     def users(request: Request):
         with store.connect() as db:
             actor(db, request, admin=True)
-            return many(db, f'SELECT {PUBLIC_USER} FROM users ORDER BY name')
+            return [public_user(user, db) for user in many(db, f'SELECT {PUBLIC_USER} FROM users ORDER BY name')]
 
     @app.post('/api/users', status_code=201)
     def create_user(payload: UserCreate, request: Request):
@@ -250,6 +280,8 @@ def create_app(data_dir=None):
     def change_password(payload: PasswordChange, request: Request):
         with store.connect() as db:
             user = actor(db, request)
+            if one(db, 'SELECT user_id FROM oidc_accounts WHERE user_id=?', (user['id'],)):
+                raise HTTPException(409, 'Manage this password through your exercise identity provider.')
             stored = one(db, 'SELECT password_hash FROM users WHERE id=?', (user['id'],))
             if not verify_password(payload.current_password, stored['password_hash']):
                 raise HTTPException(403, 'Your current password is incorrect.')
@@ -263,6 +295,8 @@ def create_app(data_dir=None):
             actor(db, request, admin=True)
             if not one(db, 'SELECT id FROM users WHERE id=?', (uid,)):
                 raise HTTPException(404, 'User not found.')
+            if one(db, 'SELECT user_id FROM oidc_accounts WHERE user_id=?', (uid,)):
+                raise HTTPException(409, 'Manage this password through the exercise identity provider.')
             db.execute('UPDATE users SET password_hash=? WHERE id=?', (hash_password(payload.password), uid))
             db.execute('DELETE FROM sessions WHERE user_id=?', (uid,))
         return {'ok': True}

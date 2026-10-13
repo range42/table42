@@ -6,6 +6,7 @@ const state = { user: null, csrf: '', exercise: null, board: null, selected: nul
 let noticeTimer;
 let loading = false;
 let queuedLoad = null;
+let oidcEnabled = false;
 
 const esc = (value = '') => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const field = (name, label, value = '', type = 'text', extra = '') => `<div class="field"><label for="${name}">${label}</label><input id="${name}" name="${name}" type="${type}" value="${esc(value)}" ${extra}></div>`;
@@ -67,12 +68,14 @@ function shell(content, active = 'exercises') {
 }
 
 function auth(needsSetup) {
+  const sso = oidcEnabled && !needsSetup;
   root.innerHTML = `<main class="auth"><section class="auth-story"><a class="brand" href="#"><img src="/static/range42-logo.svg" alt="Range42 logo">Table42</a><div class="intro"><p class="eyebrow">A Range42 application</p><h1>Bring your scenario<br>to the <span>table.</span></h1><p>Prepare the exercise. Release the next inject. Capture the decisions, and the people behind them.</p></div><footer>Simple tools for a focused tabletop exercise.</footer></section>
-    <section class="auth-form"><div><p class="eyebrow">${needsSetup ? 'Your first exercise starts here' : 'Welcome back'}</p><h2>${needsSetup ? 'Set up Table42' : 'Sign in'}</h2><p class="muted">${needsSetup ? 'Create the administrator account to start preparing exercises.' : 'Use the local account provided by your exercise director.'}</p>
+    <section class="auth-form"><div><p class="eyebrow">${needsSetup ? 'Your first exercise starts here' : 'Welcome back'}</p><h2>${needsSetup ? 'Set up Table42' : 'Sign in'}</h2><p class="muted">${needsSetup ? 'Create the administrator account to start preparing exercises.' : sso ? 'Use your exercise account to continue.' : 'Use the local account provided by your exercise director.'}</p>
+    ${sso ? '<p><a class="button primary" href="/api/oidc/login">Sign in with exercise account</a></p><details><summary>Local account</summary>' : ''}
     <form data-form="${needsSetup ? 'setup' : 'login'}">${errorSlot}${needsSetup ? field('name', 'Full name', '', 'text', 'required maxlength="120" autocomplete="name"') : ''}
     ${field('username', 'Username', '', 'text', 'required maxlength="80" autocomplete="username" autocapitalize="none"')}
     ${field('password', 'Password', '', 'password', `required ${needsSetup ? 'minlength="10"' : ''} maxlength="256" autocomplete="${needsSetup ? 'new-password' : 'current-password'}"`)}
-    ${needsSetup ? '<p class="muted">Use at least 10 characters. You can create participant accounts after signing in.</p>' : ''}<button class="primary" type="submit">${needsSetup ? 'Create administrator account' : 'Sign in'}</button></form></div></section></main>`;
+    ${needsSetup ? '<p class="muted">Use at least 10 characters. You can create participant accounts after signing in.</p>' : ''}<button class="primary" type="submit">${needsSetup ? 'Create administrator account' : 'Sign in'}</button></form>${sso ? '</details>' : ''}</div></section></main>`;
 }
 
 async function dashboard() {
@@ -375,10 +378,14 @@ function answerDisplay(q, answer) {
 
 async function usersPage() {
   const users = await api('/users');
-  shell(`<div class="page-head"><div><p class="eyebrow">Local accounts</p><h1>People</h1><p class="muted">Create an account, then assign the person to an exercise and group.</p></div><button class="primary" data-action="new-user">+ Create account</button></div><div class="card table-wrap"><table><thead><tr><th>Name</th><th>Username</th><th>Access</th><th>Account</th></tr></thead><tbody>${users.map(u => `<tr><td><strong>${esc(u.name)}</strong></td><td>${esc(u.username)}</td><td>${u.is_admin ? 'Administrator' : 'Exercise member'}</td><td>${u.id !== state.user.id ? `<button class="small" data-action="reset-password" data-id="${u.id}">Reset password</button>` : '<span class="muted">Your account</span>'}</td></tr>`).join('')}</tbody></table></div>`, 'users');
+  shell(`<div class="page-head"><div><p class="eyebrow">Accounts</p><h1>People</h1><p class="muted">Assign people to exercises and groups. Exercise accounts sign in through the identity provider.</p></div><button class="primary" data-action="new-user">+ Create account</button></div><div class="card table-wrap"><table><thead><tr><th>Name</th><th>Username</th><th>Access</th><th>Account</th></tr></thead><tbody>${users.map(u => `<tr><td><strong>${esc(u.name)}</strong></td><td>${esc(u.username)}</td><td>${u.is_admin ? 'Administrator' : 'Exercise member'}${u.enabled === false ? ' · Disabled' : ''}</td><td>${u.id === state.user.id ? '<span class="muted">Your account</span>' : u.auth_method === 'oidc' ? `<button class="small" data-action="account-access" data-id="${u.id}" data-enabled="${u.enabled === false}">${u.enabled === false ? 'Enable access' : 'Disable access'}</button>` : `<button class="small" data-action="reset-password" data-id="${u.id}">Reset password</button>`}</td></tr>`).join('')}</tbody></table></div>`, 'users');
 }
 
 function accountPage() {
+  if (state.user.auth_method === 'oidc') {
+    shell(`<div class="page-head"><div><h1>Your account</h1><p class="muted">${esc(state.user.name)}</p></div></div><div class="card"><h2>Exercise account</h2><p>Your password is managed by your exercise identity provider.</p></div>`);
+    return;
+  }
   shell(`<div class="page-head"><div><p class="eyebrow">${esc(state.user.username)}</p><h1>Your account</h1><p class="muted">${esc(state.user.name)}</p></div></div><div class="card"><h2>Change password</h2><form data-form="password">${errorSlot}${field('current_password', 'Current password', '', 'password', 'required autocomplete="current-password" maxlength="256"')}${field('new_password', 'New password', '', 'password', 'required minlength="10" maxlength="256" autocomplete="new-password"')}<button class="primary" type="submit">Update password</button></form></div>`);
 }
 
@@ -388,6 +395,7 @@ async function load(quiet = false) {
   try {
     if (!state.user) {
       const session = await api('/session');
+      oidcEnabled = session.oidc_enabled === true;
       state.user = session.user; state.csrf = session.csrf_token;
       if (!state.user) { auth(session.needs_setup); return; }
     }
@@ -456,6 +464,7 @@ document.addEventListener('click', event => {
     else if (action === 'clone-exercise' && allowDiscard()) dialog('Clone exercise', `${field('name', 'Clone exercise name', ex.name.slice(0, 153) + ' (copy)', 'text', 'required maxlength="160"')}<p class="muted">Create a new draft with the same injects, questions, and exercise material. Injects start unpublished. Replies and uploaded response evidence stay with the original exercise.</p><label class="check"><input name="include_groups" type="checkbox" checked> Copy groups</label><label class="check"><input name="include_users" type="checkbox"> Copy user assignments</label><p class="muted">User assignments reuse existing accounts and exercise roles. If groups are excluded, copied people are ungrouped. You will be a director of the clone.</p>`, 'clone', `data-id="${ex.id}"`);
     else if (action === 'new-user') dialog('Create local account', field('name', 'Full name', '', 'text', 'required maxlength="120"') + field('username', 'Username', '', 'text', 'required minlength="2" maxlength="80" pattern="[a-zA-Z0-9_.-]+" autocomplete="off"') + field('password', 'Initial password', '', 'password', 'required minlength="10" maxlength="256" autocomplete="new-password"'), 'user');
     else if (action === 'reset-password') dialog('Reset account password', '<p class="muted">This signs the person out of all sessions.</p>' + field('password', 'New password', '', 'password', 'required minlength="10" maxlength="256" autocomplete="new-password"'), 'reset', `data-id="${button.dataset.id}"`);
+    else if (action === 'account-access') { await api(`/users/${button.dataset.id}/access`, { enabled: button.dataset.enabled === 'true' }); await load(); }
     else if (action === 'new-group') dialog('Add group', field('name', 'Group name', '', 'text', 'required maxlength="120"'), 'group');
     else if (action === 'member') await memberDialog(button.dataset.id);
     else if (action === 'remove-member' && confirm('Remove this person from the exercise? Their responses will be retained.')) { await api(`/exercises/${ex.id}/members/${button.dataset.id}/remove`, {}); await load(); }
