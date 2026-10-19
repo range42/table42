@@ -1,0 +1,6 @@
+*
+!app/
+!app/**
+!pyproject.toml
+!uv.lock
+!LICENSE

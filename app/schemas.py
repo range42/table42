@@ -29,6 +29,16 @@ class UserCreate(Credentials):
         return self
 
 
+class AccountAccess(Input):
+    enabled: bool = Field(strict=True)
+
+
+class ExternalAccount(Input):
+    issuer: str = Field(min_length=1, max_length=512)
+    subject: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=120)
+
+
 class PasswordChange(Input):
     current_password: str = Field(min_length=1, max_length=256)
     new_password: str = Field(min_length=10, max_length=256)
